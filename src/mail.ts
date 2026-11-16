@@ -1,8 +1,12 @@
 import { ImapFlow, type FetchMessageObject } from 'imapflow';
 import { simpleParser } from 'mailparser';
+import { convert } from 'html-to-text';
 import { loadConfig } from './config.js';
 
-export async function withMailbox<T>(mailbox: string | undefined, action: (client: ImapFlow) => Promise<T>) {
+export async function withMailbox<T>(
+  mailbox: string | undefined,
+  action: (client: ImapFlow) => Promise<T>,
+) {
   const config = loadConfig();
   const client = new ImapFlow({
     ...config,
@@ -55,18 +59,58 @@ export async function listMail(client: ImapFlow, limit: number) {
   const { total } = mailboxInfo(client);
   if (total === 0) return [];
   const mails = await client.fetchAll(`${Math.max(1, total - limit + 1)}:*`, {
-    uid: true, envelope: true, flags: true, internalDate: true, size: true,
+    uid: true,
+    envelope: true,
+    flags: true,
+    internalDate: true,
+    size: true,
   });
   return mails.reverse().map(summary);
 }
 
+export async function listSinceMail(client: ImapFlow, since: Date) {
+  const uids = await client.search({ since: new Date(since.getTime() - 86400_000) }, { uid: true });
+  if (!uids || uids.length === 0) return [];
+  const results: ReturnType<typeof summary>[] = [];
+  for (let i = 0; i < uids.length; i += 50) {
+    const mails = await client.fetchAll(
+      uids.slice(i, i + 50),
+      {
+        uid: true,
+        envelope: true,
+        flags: true,
+        internalDate: true,
+        size: true,
+      },
+      { uid: true },
+    );
+    for (const mail of mails) {
+      if (mail.internalDate instanceof Date && mail.internalDate >= since)
+        results.push(summary(mail));
+    }
+  }
+  return results.sort((a, b) => a.uid - b.uid);
+}
+
 export async function getMail(client: ImapFlow, uid: number, maxBytes: number) {
-  const metadata = await client.fetchOne(String(uid), {
-    uid: true, envelope: true, flags: true, internalDate: true, size: true,
-  }, { uid: true });
+  const metadata = await client.fetchOne(
+    String(uid),
+    {
+      uid: true,
+      envelope: true,
+      flags: true,
+      internalDate: true,
+      size: true,
+    },
+    { uid: true },
+  );
   if (!metadata) throw new Error(`UID ${uid} のメールは見つかりません。`);
-  if (metadata.size === undefined) throw new Error(`UID ${uid} のメールサイズを確認できませんでした。`);
-  if (metadata.size > maxBytes) throw new Error(`UID ${uid} は取得上限 ${maxBytes} bytes を超えています。--max-bytes で変更できます。`);
+  if (metadata.size === undefined)
+    throw new Error(`UID ${uid} のメールサイズを確認できませんでした。`);
+  if (metadata.size > maxBytes)
+    throw new Error(
+      `UID ${uid} は取得上限 ${maxBytes} bytes を超えています。--max-bytes で変更できます。`,
+    );
   const mail = await client.fetchOne(String(uid), { source: true, uid: true }, { uid: true });
   if (!mail || !mail.source) throw new Error(`UID ${uid} の本文を取得できませんでした。`);
   if (mail.source.length > maxBytes) throw new Error('メールサイズが取得上限を超えています。');
@@ -81,10 +125,29 @@ export async function parseMail(source: Buffer) {
     messageId: mail.messageId ?? null,
     date: mail.date?.toISOString() ?? null,
     from: mail.from?.text ?? '',
-    to: (Array.isArray(mail.to) ? mail.to : mail.to ? [mail.to] : []).map(a => a.text),
-    text: mail.text ?? '',
-    attachments: mail.attachments.map(a => ({
-      filename: a.filename ?? null, contentType: a.contentType, size: a.size,
+    to: (Array.isArray(mail.to) ? mail.to : mail.to ? [mail.to] : []).map((a) => a.text),
+    text: mail.text?.trim()
+      ? mail.text
+      : typeof mail.html === 'string'
+        ? convert(mail.html, {
+            wordwrap: false,
+            selectors: [
+              { selector: 'a', options: { ignoreHref: true } },
+              { selector: 'img', format: 'skip' },
+            ],
+          })
+        : '',
+    attachments: mail.attachments.map((a) => ({
+      filename: a.filename ?? null,
+      contentType: a.contentType,
+      size: a.size,
     })),
+    calendarParts: mail.attachments
+      .filter(
+        (a) =>
+          /(?:text\/calendar|application\/ics)/i.test(a.contentType) ||
+          /\.ics$/i.test(a.filename ?? ''),
+      )
+      .map((a) => a.content.toString('utf8')),
   };
 }

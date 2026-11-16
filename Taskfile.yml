@@ -27,7 +27,24 @@ tasks:
       - task: list
       - task: inspect
   verify:
-    desc: 型チェックとテストを順番に実行
+    desc: 整形チェック・型チェック・テストを順番に実行
     cmds:
+      - npm run format:check
       - npm run typecheck
       - npm test
+  format:
+    desc: Prettierでファイルを整形
+    cmds:
+      - npm run format
+  format:check:
+    desc: Prettierで整形済みか確認
+    cmds:
+      - npm run format:check
+  calendar:dry-run:
+    desc: 先月初日以降のメールから予定候補を抽出（登録しない）
+    cmds:
+      - npm run --silent cli -- dry-run
+  calendar:audit-forwards:
+    desc: Gmail宛の転送済みメールを取得して判定を監査（送信・登録なし）
+    cmds:
+      - npm run --silent cli -- audit-forwards

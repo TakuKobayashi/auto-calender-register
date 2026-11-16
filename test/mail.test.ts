@@ -15,21 +15,29 @@ test('認証情報は必須、TLSとYahoo! JAPANの接続先を使用', () => {
 });
 
 test('MIMEの日本語件名と本文を復号し、タイムゾーンをUTCに正規化', async () => {
-  const result = await parseMail(Buffer.from([
-    'From: sender@example.com', 'To: user@example.com',
-    'Subject: =?UTF-8?B?5LqI5a6a?=',
-    'Date: Mon, 16 Nov 2026 12:00:00 -0500',
-    'Content-Type: text/plain; charset=utf-8',
-    'Content-Transfer-Encoding: base64', '',
-    Buffer.from('予定は2026年12月1日です。').toString('base64'),
-  ].join('\r\n')));
+  const result = await parseMail(
+    Buffer.from(
+      [
+        'From: sender@example.com',
+        'To: user@example.com',
+        'Subject: =?UTF-8?B?5LqI5a6a?=',
+        'Date: Mon, 16 Nov 2026 12:00:00 -0500',
+        'Content-Type: text/plain; charset=utf-8',
+        'Content-Transfer-Encoding: base64',
+        '',
+        Buffer.from('予定は2026年12月1日です。').toString('base64'),
+      ].join('\r\n'),
+    ),
+  );
   assert.equal(result.subject, '予定');
   assert.equal(result.text.trim(), '予定は2026年12月1日です。');
   assert.equal(result.date, '2026-11-16T17:00:00.000Z');
 });
 
 test('HTMLメールもテキスト本文として取得', async () => {
-  const result = await parseMail(Buffer.from('Content-Type: text/html; charset=utf-8\r\n\r\n<p>Meeting at 10:00 UTC</p>'));
+  const result = await parseMail(
+    Buffer.from('Content-Type: text/html; charset=utf-8\r\n\r\n<p>Meeting at 10:00 UTC</p>'),
+  );
   assert.match(result.text, /Meeting at 10:00 UTC/);
 });
 
@@ -46,13 +54,19 @@ test('一覧はメールボックスの範囲内で取得し、新着順に出�
       return [{ uid: 5 }, { uid: 9 }];
     },
   } as unknown as ImapFlow;
-  assert.deepEqual((await listMail(client, 10)).map(m => m.uid), [9, 5]);
+  assert.deepEqual(
+    (await listMail(client, 10)).map((m) => m.uid),
+    [9, 5],
+  );
 });
 
 test('巨大なメールは本文ダウンロード前に拒否する', async () => {
   let calls = 0;
   const client = {
-    fetchOne: async () => { calls++; return { uid: 1, size: 200 }; },
+    fetchOne: async () => {
+      calls++;
+      return { uid: 1, size: 200 };
+    },
   } as unknown as ImapFlow;
   await assert.rejects(getMail(client, 1, 100), /取得上限/);
   assert.equal(calls, 1);

@@ -1,1 +1,37 @@
-{"name":"auto-calender-register","version":"0.1.0","private":true,"type":"module","engines":{"node":">=22"},"scripts":{"cli":"tsx src/cli.ts","typecheck":"tsc --noEmit","test":"tsx --test test/*.test.ts","task":"task"},"dependencies":{"commander":"^15.1.0","dotenv":"^18.0.10","imapflow":"^2.12.1","mailparser":"^3.14.4"},"devDependencies":{"@go-task/cli":"3.45.4","@types/mailparser":"^3.9.0","@types/node":"^26.6.6","tsx":"^4.23.15","typescript":"^7.0.2"}}
+{
+  "name": "auto-calender-register",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "cli": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "task": "task",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "chrono-node": "^2.10.3",
+    "commander": "^15.1.0",
+    "dotenv": "^18.0.10",
+    "html-to-text": "^10.0.1",
+    "imapflow": "^2.12.1",
+    "luxon": "^3.7.2",
+    "mailparser": "^3.14.4",
+    "node-ical": "^0.27.6"
+  },
+  "devDependencies": {
+    "@go-task/cli": "3.45.4",
+    "@types/html-to-text": "^9.0.4",
+    "@types/luxon": "^3.7.6",
+    "@types/mailparser": "^3.9.0",
+    "@types/node": "^26.6.6",
+    "prettier": "3.10.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
