@@ -1,0 +1,33 @@
+version: '3'
+
+tasks:
+  default:
+    cmds:
+      - task --list
+  check:
+    desc: Yahooメールの接続確認
+    cmds:
+      - npm run --silent cli -- check
+  list:
+    desc: 最新10件の一覧を表示
+    cmds:
+      - npm run --silent cli -- list
+  show:
+    desc: UIDを指定して本文を表示（npm run task -- show -- 123）
+    cmds:
+      - npm run --silent cli -- show {{.CLI_ARGS}}
+  inspect:
+    desc: 最新3件の本文を順番に表示
+    cmds:
+      - npm run --silent cli -- inspect
+  mail:review:
+    desc: 接続確認→一覧→最新3件の本文取得を順番に実行
+    cmds:
+      - task: check
+      - task: list
+      - task: inspect
+  verify:
+    desc: 型チェックとテストを順番に実行
+    cmds:
+      - npm run typecheck
+      - npm test
