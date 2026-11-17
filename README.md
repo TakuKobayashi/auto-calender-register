@@ -39,16 +39,16 @@ Yahoo!メールの「設定」→「IMAP/POP/SMTPアクセス」で、Yahoo! JAP
 
 ```sh
 # 1. 接続確認: メールボックス名・UIDVALIDITY・メール総数
-node --import tsx src/cli.ts check
+npm run mail:check
 
 # 2. 最新10件の一覧: UID・件名・送信者・宛先・日時・既読フラグ・サイズ
-node --import tsx src/cli.ts list --limit 10
+npm run mail:list -- --limit 10
 
 # 3. 一覧に表示されたUIDを指定して本文を取得（123は置き換える）
-node --import tsx src/cli.ts show 123
+npm run mail:show -- 123
 
 # 4. 最新3件の一覧と本文を順に取得
-node --import tsx src/cli.ts inspect --limit 3
+npm run mail:inspect -- --limit 3
 ```
 
 出力はJSONです。`inspect` は一覧に続けてメールごとのJSONを出力するため、出力全体は単一のJSON文書ではありません。
@@ -73,22 +73,23 @@ UIDはメールボックス内の識別子です。将来の永続化ではア�
 最新パッケージのインストーラー依存に監査警告があったため、監査が通る `3.45.4` を固定しています。
 
 ```sh
-# タスク一覧
-npm run task
+# 複数コマンドをまとめたタスクの一覧
+npm run task:list
 
 # 接続確認 → 最新10件の一覧 → 最新3件の本文（順次実行）
 npm run task mail:review
 
 # 個別実行
-npm run task check
-npm run task list
-npm run task inspect
+npm run mail:check
+npm run mail:list
+npm run mail:inspect
 
 # 型チェック → テスト
 npm run task verify
 ```
 
 `Taskfile.yml` の `cmds` に定義した順で実行し、途中で失敗したら停止します。
+単独コマンドの定義は `package.json` の `scripts` に集約し、Taskfileは複数コマンドの順次実行だけに使います。
 動的な引数を付ける本文確認は上記の `node --import tsx ... show 123` が簡単です。
 npm経由なら `npm run cli -- show 123` でも実行できます。
 PowerShellでnpmへのオプション転送がうまくいかない場合は `npm.cmd run cli -- list --limit 5` のように `npm.cmd` を使ってください。
@@ -132,13 +133,13 @@ Cloudflare Workersは今のNode.js CLIをそのまま動かす対象ではなく
 指定フォルダー内の全対象メールを取得します。未読に限定したり、件数で打ち切ったりしません。
 
 ```sh
-node --import tsx src/cli.ts dry-run --since 2026-10-01
+npm run calendar:dry-run -- --since 2026-10-01
 ```
 
 次は実行日の先月初日を自動で選びます。
 
 ```sh
-npm run task calendar:dry-run
+npm run calendar:dry-run
 ```
 
 出力ファイル（すべて `reports/` 内、Git管理対象外）:
@@ -150,7 +151,7 @@ npm run task calendar:dry-run
 本文を再取得せず、現在時刻で再判定する場合:
 
 ```sh
-node --import tsx src/cli.ts dry-run --since 2026-10-01 --from-cache reports/mail-cache.json
+npm run calendar:dry-run -- --since 2026-10-01 --from-cache reports/mail-cache.json
 ```
 
 キャッシュの受信開始日と `--since` は一致している必要があります。
@@ -197,7 +198,7 @@ Googleカレンダーは未接続のため、標準では `calendarDuplicateChec
 これはGoogle APIからの最新データ取得の代わりではありません。
 
 ```sh
-node --import tsx src/cli.ts dry-run --since 2026-10-01 --from-cache reports/mail-cache.json --existing-events existing-events.json
+npm run calendar:dry-run -- --since 2026-10-01 --from-cache reports/mail-cache.json --existing-events existing-events.json
 ```
 
 一部でも取得・解析に失敗した場合は `complete: false`、終了コード2になります。
@@ -212,10 +213,10 @@ Gmailへの接続・転送・Grokbotへの指示は行いません。既存のGr
 
 ```sh
 # 受信キャッシュを取得済みの場合。Sentから転送を読み、ルールで全件監査
-node --import tsx src/cli.ts audit-forwards --since 2026-10-01
+npm run calendar:audit-forwards -- --since 2026-10-01
 
 # メールに再接続せず監査
-node --import tsx src/cli.ts audit-forwards --since 2026-10-01 --from-cache reports/sent-forward-cache.json
+npm run calendar:audit-forwards -- --since 2026-10-01 --from-cache reports/sent-forward-cache.json
 ```
 
 `reports/forward-audit.md` と `forward-audit.json` に、転送元の予定・原本との照合結果・
@@ -235,14 +236,14 @@ Ollamaの推論を使う場合は、インストール済みのモデル名を�
 
 ```sh
 # 最初の6件までLLMで検証（ルール監査は全転送が対象）
-node --import tsx src/cli.ts audit-forwards --from-cache reports/sent-forward-cache.json --ollama-model qwen3.5:9b --limit 6
+npm run calendar:audit-forwards -- --from-cache reports/sent-forward-cache.json --ollama-model qwen3.5:9b --limit 6
 
 # 特定のSent UIDを比較したい場合（123,456はレポートのUIDに置き換え）
-node --import tsx src/cli.ts audit-forwards --from-cache reports/sent-forward-cache.json --ollama-model qwen3.5:9b --sample-uids 123,456 --limit 2
+npm run calendar:audit-forwards -- --from-cache reports/sent-forward-cache.json --ollama-model qwen3.5:9b --sample-uids 123,456 --limit 2
 
 # 受信メール全体のうち、候補・要確認・予約や旅程らしい文面を再判定
 # 多数の推論が走るため、まず上記の少数監査でモデルを検証してください
-node --import tsx src/cli.ts dry-run --since 2026-10-01 --from-cache reports/mail-cache.json --ollama-model qwen3.5:9b
+npm run calendar:dry-run -- --since 2026-10-01 --from-cache reports/mail-cache.json --ollama-model qwen3.5:9b
 ```
 
 API接続先は `http://127.0.0.1:11434` 固定です。メール本文を外部LLMには送信しません。
@@ -280,7 +281,6 @@ npm run format
 npm run format:check
 ```
 
-Taskfile経由では `npm run task format` / `npm run task format:check` でも実行できます。
 `npm run task verify` は整形チェック・型チェック・テストを順番に実行します。
 設定は `.prettierrc.json`、対象外は `.prettierignore` に記載しています。
 メール本文を含む `reports/`、環境変数ファイル、生成物、ロックファイルは整形対象外です。

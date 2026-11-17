@@ -183,7 +183,7 @@ authCommands
   .command('status')
   .description('保存済み認証情報でCalendar APIへ接続確認')
   .option('--auth-file <file>', 'ローカル認証情報', DEFAULT_AUTH_FILE)
-  .option('--calendar-id <id>', 'カレンダーID', process.env.GOOGLE_CALENDAR_ID || 'primary')
+  .option('--calendar-id <id>', 'カレンダーID（省略時はメインカレンダー）', 'primary')
   .action(async (options) => {
     const api = new GoogleCalendar(await createGoogleAuth(options.authFile), options.calendarId);
     const now = new Date();
@@ -210,7 +210,7 @@ calendarCommands
   .command('sync')
   .description('Googleの既存予定と照合（--apply 指定時のみ新規登録）')
   .option('--report <file>', '完了済み選別レポート', 'reports/dry-run.json')
-  .option('--calendar-id <id>', 'カレンダーID', process.env.GOOGLE_CALENDAR_ID || 'primary')
+  .option('--calendar-id <id>', 'カレンダーID（省略時はメインカレンダー）', 'primary')
   .option('--auth-file <file>', 'ローカルOAuth情報', DEFAULT_AUTH_FILE)
   .option('--apply', '重複していない未来の確定候補を実際に登録', false)
   .option('--output <file>', '照合・登録結果のJSON', 'reports/calendar-sync.json')

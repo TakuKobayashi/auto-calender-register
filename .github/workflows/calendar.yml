@@ -11,6 +11,11 @@ on:
         description: 'Googleカレンダーへ実際に登録する'
         type: boolean
         default: false
+      calendar_id:
+        description: '登録先カレンダーID（省略時はメインカレンダー）'
+        type: string
+        required: false
+        default: 'primary'
       model:
         description: 'Ollamaモデル（空欄はルール方式のみ）'
         type: string
@@ -37,7 +42,6 @@ jobs:
       YAHOO_IMAP_PORT: '993'
       YAHOO_IMAP_MAILBOX: ${{ vars.YAHOO_IMAP_MAILBOX || 'INBOX' }}
       GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
-      GOOGLE_CALENDAR_ID: ${{ vars.GOOGLE_CALENDAR_ID || 'primary' }}
       OLLAMA_MODEL: ${{ inputs.model }}
       OLLAMA_TIMEOUT_MS: '600000'
       OLLAMA_NUM_PARALLEL: '1'
@@ -86,18 +90,22 @@ jobs:
         shell: bash
         run: |
           mkdir -p reports
-          args=(--import tsx src/cli.ts dry-run)
+          args=(run --silent calendar:dry-run --)
           if [[ -n "$SCAN_SINCE" ]]; then args+=(--since "$SCAN_SINCE"); fi
           if [[ -n "$OLLAMA_MODEL" ]]; then args+=(--ollama-model "$OLLAMA_MODEL"); fi
-          node "${args[@]}" > reports/selection-summary.json
+          npm "${args[@]}" > reports/selection-summary.json
       - name: Export ICS
-        run: node --import tsx src/cli.ts calendar export-ics
+        run: npm run calendar:ics
       - name: Compare or register Google events
         shell: bash
+        env:
+          TARGET_CALENDAR_ID: ${{ inputs.calendar_id }}
         run: |
-          args=(--import tsx src/cli.ts calendar sync)
+          operation=calendar:plan
           if [[ "$APPLY" = true ]] || [[ "$GITHUB_EVENT_NAME" = schedule && "$REGISTER_ON_SCHEDULE" = true ]]; then
-            args+=(--apply)
+            operation=calendar:register
           fi
-          node "${args[@]}"
+          args=(run --silent "$operation" --)
+          if [[ -n "$TARGET_CALENDAR_ID" ]]; then args+=(--calendar-id "$TARGET_CALENDAR_ID"); fi
+          npm "${args[@]}"
       # reports/にはメール本文と予定が含まれるため、公開ログやArtifactsにはアップロードしない。

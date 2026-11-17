@@ -8,17 +8,17 @@
 
 ```powershell
 # OAuth不要: 他のカレンダーに取り込めるICSへ出力
-npm run task calendar:ics
+npm run calendar:ics
 
 # 以下は初回のOAuth設定後
-npm run task auth:login
-npm run task auth:status
+npm run auth:login
+npm run auth:status
 
 # Googleカレンダーの既存予定と照合するだけ（書き込み0件）
-npm run task calendar:plan
+npm run calendar:plan
 
 # 重複していない候補を実際に登録
-npm run task calendar:register
+npm run calendar:register
 ```
 
 古い選別ファイルには、後から届いた変更・キャンセルが反映されません。
@@ -40,7 +40,7 @@ npm run task calendar:register
 ## ローカルでOAuthを完了する
 
 ```powershell
-node --import tsx src/cli.ts auth login
+npm run auth:login
 ```
 
 ブラウザーが開くので、登録先のGoogleアカウントでログインし、カレンダーの予定へのアクセスを許可します。
@@ -54,8 +54,8 @@ node --import tsx src/cli.ts auth login
 別のファイルを使う場合:
 
 ```powershell
-node --import tsx src/cli.ts auth login --client-file .secrets/my-client.json --auth-file .secrets/my-auth.json
-node --import tsx src/cli.ts auth status --auth-file .secrets/my-auth.json
+npm run auth:login -- --client-file .secrets/my-client.json --auth-file .secrets/my-auth.json
+npm run auth:status -- --auth-file .secrets/my-auth.json
 ```
 
 保存されるのは、バージョン・クライアントID・クライアントシークレット・リフレッシュトークン等です。
@@ -70,17 +70,18 @@ node --import tsx src/cli.ts auth status --auth-file .secrets/my-auth.json
 
 標準の `primary` は、OAuthで認証したGoogleアカウントのメインカレンダーです。
 別カレンダーへ登録する場合は、Googleカレンダーの「設定」→対象カレンダー→「カレンダーの統合」でIDを確認し、
-`.env` の `GOOGLE_CALENDAR_ID` または `--calendar-id` で指定します。認証したユーザーに書き込み権限が必要です。
+`--calendar-id` 引数で指定します。省略時は `primary` へ登録でき、環境変数での設定は不要です。
+認証したユーザーに書き込み権限が必要です。
 
 ```powershell
 # オンラインで重複確認。作成予定・既存・重複疑いを reports/calendar-sync.json に保存
-node --import tsx src/cli.ts calendar sync --report reports/dry-run.json
+npm run calendar:plan -- --report reports/dry-run.json
 
 # 実際に登録。確認プロンプトはなく、--applyの指定で書き込みます
-node --import tsx src/cli.ts calendar sync --report reports/dry-run.json --apply
+npm run calendar:register -- --report reports/dry-run.json
 
 # 別カレンダー・別の結果ファイル
-node --import tsx src/cli.ts calendar sync --calendar-id 'YOUR_CALENDAR_ID' --apply --output reports/another-sync.json
+npm run calendar:register -- --calendar-id 'YOUR_CALENDAR_ID' --output reports/another-sync.json
 ```
 
 照合は毎回Google APIから最新の予定を取得し、全ページと繰り返し予定のインスタンスを対象にします。
@@ -103,7 +104,7 @@ Grokbotとの並行登録をGoogle側で一つのトランザクションには�
 ## ICSとして出力する
 
 ```powershell
-node --import tsx src/cli.ts calendar export-ics --report reports/dry-run.json --output reports/events.ics
+npm run calendar:ics -- --report reports/dry-run.json --output reports/events.ics
 ```
 
 OAuthなしで使えます。Appleカレンダー、Outlookなど、ICSに対応するアプリで取り込めます。
@@ -121,7 +122,7 @@ Googleが新規API登録時に付けるiCalUIDと、オフラインICSのUIDは�
 必要なら `auth export` で別のファイルへコピーできます。内容をコンソールに出しません。
 
 ```powershell
-node --import tsx src/cli.ts auth export
+npm run auth:export
 
 # ghで設定する場合。OWNER/REPOは実際のリポジトリに置き換える
 Get-Content -Raw -LiteralPath .secrets/github-google-oauth.json | gh secret set GOOGLE_OAUTH_JSON --repo OWNER/REPO
@@ -134,7 +135,6 @@ GitHubの画面では「Settings → Secrets and variables → Actions → New r
 | Secret   | `YAHOO_IMAP_USER`     | Yahoo! JAPAN ID                     |
 | Secret   | `YAHOO_IMAP_PASSWORD` | Yahoo!メールのIMAP用パスワード      |
 | Secret   | `GOOGLE_OAUTH_JSON`   | `auth login` で保存した認証JSON全体 |
-| Variable | `GOOGLE_CALENDAR_ID`  | 任意。未設定なら `primary`          |
 | Variable | `YAHOO_IMAP_MAILBOX`  | 任意。未設定なら `INBOX`            |
 
 他のSecrets管理サービスでも、実行環境の `GOOGLE_OAUTH_JSON` に同じJSONを渡せば使えます。
@@ -155,6 +155,8 @@ JSONはBase64ではなく、そのままのJSON文字列を渡します。
 5. Googleの既存予定と照合し、`apply` が有効な場合だけ新規登録する。
 
 初期状態は手動実行 `workflow_dispatch` のみで、`apply` はfalseです。
+登録先は実行時の `calendar_id` 入力から `--calendar-id` 引数へ渡します。空欄・省略時は `primary` です。
+スケジュール実行時も、引数指定がなければ `primary` へ登録します。
 スケジュール運用は、コメントにしてある `schedule` を有効にし、書き込みも有効にする場合は `REGISTER_ON_SCHEDULE` をtrueにします。
 スケジュール時は `qwen3.5:9b` を使います。認証のやり直しはrunner上では行いません。
 本文・判定詳細・認証ファイルは公開ログやArtifactsにアップロードしません。
