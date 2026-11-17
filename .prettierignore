@@ -10,3 +10,5 @@ token.json
 .env.*
 package-lock.json
 *.log
+db/dumps/
+drizzle/meta/

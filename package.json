@@ -25,19 +25,35 @@
     "calendar:register": "tsx src/cli.ts calendar sync --apply",
     "calendar:ics": "tsx src/cli.ts calendar export-ics",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "db:up": "docker compose up -d --wait postgres",
+    "db:stop": "docker compose stop postgres",
+    "db:down": "docker compose down",
+    "db:logs": "docker compose logs --tail 100 postgres",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "tsx src/db/cli.ts migrate",
+    "db:studio": "drizzle-kit studio",
+    "db:status": "tsx src/db/cli.ts status",
+    "db:holds": "tsx src/db/cli.ts holds",
+    "db:reviews": "tsx src/db/cli.ts reviews",
+    "db:resolve": "tsx src/db/cli.ts resolve",
+    "db:dump": "tsx src/db/cli.ts dump",
+    "db:restore": "tsx src/db/cli.ts restore",
+    "test:db": "tsx --test test/db.integration.ts"
   },
   "dependencies": {
     "chrono-node": "^2.10.3",
     "commander": "^15.1.0",
     "dotenv": "^18.0.10",
+    "drizzle-orm": "^0.45.4",
     "google-auth-library": "^11.3.4",
     "html-to-text": "^10.0.1",
     "imapflow": "^2.12.1",
     "luxon": "^3.7.2",
     "mailparser": "^3.14.4",
     "node-ical": "^0.27.6",
-    "open": "^11.0.4"
+    "open": "^11.0.4",
+    "pg": "^8.23.1"
   },
   "devDependencies": {
     "@go-task/cli": "3.45.4",
@@ -45,8 +61,13 @@
     "@types/luxon": "^3.7.6",
     "@types/mailparser": "^3.9.0",
     "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
+    "drizzle-kit": "^0.31.11",
     "prettier": "3.10.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
+  },
+  "overrides": {
+    "esbuild": "^0.28.2"
   }
 }

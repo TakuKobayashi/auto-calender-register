@@ -56,6 +56,13 @@ jobs:
           node-version: '22'
           cache: npm
       - run: npm ci
+      - name: Set up database with shared Compose
+        id: database
+        run: npm run task db:setup
+      - name: Restore SQL when a snapshot is provided
+        shell: bash
+        run: |
+          if [[ -f db/dumps/latest.txt ]]; then npm run db:restore; fi
       - name: Scheduled model
         if: github.event_name == 'schedule'
         run: echo 'OLLAMA_MODEL=qwen3.5:9b' >> "$GITHUB_ENV"
@@ -90,7 +97,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p reports
-          args=(run --silent calendar:dry-run --)
+          args=(run --silent calendar:dry-run -- --database)
           if [[ -n "$SCAN_SINCE" ]]; then args+=(--since "$SCAN_SINCE"); fi
           if [[ -n "$OLLAMA_MODEL" ]]; then args+=(--ollama-model "$OLLAMA_MODEL"); fi
           npm "${args[@]}" > reports/selection-summary.json
@@ -105,7 +112,14 @@ jobs:
           if [[ "$APPLY" = true ]] || [[ "$GITHUB_EVENT_NAME" = schedule && "$REGISTER_ON_SCHEDULE" = true ]]; then
             operation=calendar:register
           fi
-          args=(run --silent "$operation" --)
+          args=(run --silent "$operation" -- --database)
           if [[ -n "$TARGET_CALENDAR_ID" ]]; then args+=(--calendar-id "$TARGET_CALENDAR_ID"); fi
           npm "${args[@]}"
+      - name: Dump database as per-table SQL
+        if: always() && steps.database.outcome == 'success'
+        run: npm run db:dump
+      - name: Stop database
+        if: always()
+        run: npm run db:down
+      # db/dumps/の永続保存・次回取得は保存先の運用に合わせて設定する。
       # reports/にはメール本文と予定が含まれるため、公開ログやArtifactsにはアップロードしない。

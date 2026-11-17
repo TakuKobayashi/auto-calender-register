@@ -3,7 +3,15 @@ import { resolve } from 'node:path';
 import { DateTime } from 'luxon';
 import { classifyAll, type MailPlan, type EventPlan } from './classify.js';
 import type { Collection } from './collect.js';
-import { extractWithOllama, extractionToPlan, modelText } from './ollama.js';
+import {
+  extractWithOllama,
+  extractionToPlan,
+  modelText,
+  extractionCacheKey,
+  localModelDigest,
+  validateExtraction,
+} from './ollama.js';
+import type { Store } from './db/store.js';
 import { finalize } from './classify.js';
 
 type ExistingEvent = {
@@ -83,6 +91,7 @@ export async function writeDryRun(
   existingFile?: string,
   now = new Date(),
   model?: string,
+  store?: Store,
 ) {
   const overrides = new Map<number, MailPlan>();
   if (model) {
@@ -103,12 +112,13 @@ export async function writeDryRun(
         continue;
       console.error(`Ollama再判定 UID ${mail.uid}`);
       try {
-        const inferred = extractionToPlan(
-          mail,
-          await extractWithOllama(mail, model),
-          now,
-          finalize,
-        );
+        const key = extractionCacheKey(mail, model, await localModelDigest(model));
+        const cached = await store?.getExtraction(key);
+        const extraction = cached
+          ? validateExtraction(cached)
+          : await extractWithOllama(mail, model);
+        if (!cached && store) await store.saveExtraction(key, model, extraction);
+        const inferred = extractionToPlan(mail, extraction, now, finalize);
         overrides.set(mail.uid, reconcileModelPlan(plan, inferred));
       } catch {
         overrides.set(mail.uid, {
@@ -164,6 +174,7 @@ export async function writeDryRun(
     since: collection.since,
     mailbox: collection.mailbox,
     uidValidity: collection.uidValidity,
+    sourceScope: collection.sourceScope,
     mailCollectedAt: collection.collectedAt,
     complete: collection.complete && counts.error === 0 && plans.length === collection.matched,
     calendarDuplicateCheck: existingFile ? 'local_snapshot_only' : 'not_connected',
@@ -264,6 +275,7 @@ export async function writeDryRun(
     mode: 0o600,
   });
   await writeFile(resolve(directory, 'dry-run.md'), lines.join('\n'), { mode: 0o600 });
+  if (store && collection.sourceScope) await store.savePlans(collection.sourceScope, plans);
   return report;
 }
 

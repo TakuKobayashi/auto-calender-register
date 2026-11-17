@@ -1,0 +1,22 @@
+name: auto-calendar-register
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: auto_calender_register
+      POSTGRES_DB: auto_calender_register
+      POSTGRES_HOST_AUTH_METHOD: trust
+    command: ['postgres', '-c', 'hba_file=/etc/postgresql/pg_hba.conf']
+    ports:
+      - '127.0.0.1:55432:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-U', 'auto_calender_register', '-d', 'auto_calender_register']
+      interval: 3s
+      timeout: 3s
+      retries: 30
+volumes:
+  postgres-data:

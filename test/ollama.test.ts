@@ -4,6 +4,8 @@ import { classifyMail, finalize } from '../src/classify.js';
 import type { CollectedMail } from '../src/collect.js';
 import {
   dateSupported,
+  extractionCacheKey,
+  localModelDigest,
   extractionToPlan,
   modelText,
   unwrapForward,
@@ -14,6 +16,24 @@ import { filterGmailForwards, matchOriginal } from '../src/forward-audit.js';
 import { reconcileModelPlan } from '../src/dry-run.js';
 
 const now = new Date('2026-11-16T00:00:00Z');
+
+test('モデル更新でdigestが変われば、同じモデル名とメールでも抽出キャッシュを更新する', () => {
+  const original = extractionCacheKey(mail(), 'model', 'a'.repeat(64));
+  assert.equal(extractionCacheKey(mail({ flags: ['\\Seen'] }), 'model', 'a'.repeat(64)), original);
+  assert.notEqual(extractionCacheKey(mail(), 'model', 'b'.repeat(64)), original);
+});
+
+test('digest未取得・クラウドモデルでは保存済みの抽出結果も利用しない', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request) => {
+    if (String(input).endsWith('/api/tags'))
+      return Response.json({
+        models: [{ name: 'missing-digest' }, { name: 'remote-model', digest: 'a'.repeat(64) }],
+      });
+    return Response.json({ remote_host: 'https://example.com', details: { format: 'gguf' } });
+  });
+  await assert.rejects(localModelDigest('missing-digest'), /digest/);
+  await assert.rejects(localModelDigest('remote-model'), /クラウド/);
+});
 function mail(overrides: Partial<CollectedMail> = {}): CollectedMail {
   return {
     uid: 1,

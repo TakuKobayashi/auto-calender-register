@@ -18,6 +18,33 @@ import {
 import { readSelection } from './selection.js';
 import { exportIcs } from './ics.js';
 import { GoogleCalendar, syncCalendarToFile } from './google-calendar.js';
+import { Store, mailScope, calendarTarget } from './db/store.js';
+import { DrizzleQueryError } from 'drizzle-orm';
+
+async function withTracking<T>(enabled: boolean, action: (store?: Store) => Promise<T>) {
+  if (!enabled) return action();
+  const store = new Store();
+  let unlock: (() => Promise<void>) | undefined;
+  try {
+    unlock = await store.lock('calendar-db:maintenance', true);
+    return await action(store);
+  } catch (error) {
+    if (
+      error instanceof DrizzleQueryError ||
+      /^[0-9A-Z]{5}$/.test(String((error as { code?: string })?.code ?? ''))
+    )
+      throw new Error('DBへの読み書きに失敗しました。接続とマイグレーションを確認してください。');
+    throw error;
+  } finally {
+    try {
+      await unlock?.();
+    } finally {
+      await store.close();
+    }
+  }
+}
+const mailAccount = () =>
+  `${process.env.YAHOO_IMAP_HOST || 'imap.mail.yahoo.co.jp'}:${(process.env.YAHOO_IMAP_USER ?? '').trim().toLowerCase()}`;
 
 const program = new Command()
   .name('yahoo-mail')
@@ -93,32 +120,81 @@ program
     '既存Google予定のJSONスナップショットで重複照合（省略時は未確認）',
   )
   .option('--ollama-model <name>', 'ローカルOllamaで文脈を再判定（実験機能・モデル指定必須）')
-  .action(async (options) => {
-    const since = parseSince(options.since);
-    const collection = options.fromCache
-      ? await readCollection(options.fromCache, since)
-      : await withMailbox(options.mailbox, (client) =>
-          collect(client, since, options.outputDir, options.maxBytes),
+  .option('--database', 'PostgreSQLへ進捗・抽出結果を保存（既定で有効）', true)
+  .option('--no-database', 'DBを使わずJSONのみ保存')
+  .action(async (options) =>
+    withTracking(options.database, async (store) => {
+      const unlock = await store?.lock(
+        `mail:${mailAccount()}:${options.mailbox || process.env.YAHOO_IMAP_MAILBOX || 'INBOX'}`,
+      );
+      let runId: number | undefined;
+      try {
+        runId = await store?.startRun('mail', mailAccount());
+        const since = parseSince(options.since);
+        const collection = options.fromCache
+          ? await readCollection(options.fromCache, since)
+          : await withMailbox(options.mailbox, (client) => {
+              const info = mailboxInfo(client);
+              const scope = mailScope(mailAccount(), info.mailbox, info.uidValidity);
+              return collect(
+                client,
+                since,
+                options.outputDir,
+                options.maxBytes,
+                store ? { store, scope } : undefined,
+              );
+            });
+        if (store && options.fromCache) {
+          collection.sourceScope = mailScope(
+            mailAccount(),
+            collection.mailbox,
+            collection.uidValidity,
+          );
+          await store.ensureMailbox(collection.sourceScope, collection);
+          for (const mail of collection.messages)
+            await store.saveMail(collection.sourceScope, mail);
+          for (const error of collection.errors)
+            await store.fetchError(collection.sourceScope, error.uid, error.reason);
+          await store.completeScan(
+            collection.sourceScope,
+            Math.max(
+              0,
+              ...collection.messages.map((m) => m.uid),
+              ...collection.errors.map((e) => e.uid),
+            ),
+            collection.complete,
+          );
+        }
+        const report = await writeDryRun(
+          collection,
+          options.outputDir,
+          options.existingEvents,
+          new Date(),
+          options.ollamaModel,
+          store,
         );
-    const report = await writeDryRun(
-      collection,
-      options.outputDir,
-      options.existingEvents,
-      new Date(),
-      options.ollamaModel,
-    );
-    output({
-      mode: report.mode,
-      complete: report.complete,
-      calendarWrites: 0,
-      calendarDuplicateCheck: report.calendarDuplicateCheck,
-      summary: report.summary,
-      report: `${options.outputDir}/dry-run.md`,
-      json: `${options.outputDir}/dry-run.json`,
-      proposed: report.proposed,
-    });
-    if (!report.complete) process.exitCode = 2;
-  });
+        output({
+          mode: report.mode,
+          complete: report.complete,
+          calendarWrites: 0,
+          calendarDuplicateCheck: report.calendarDuplicateCheck,
+          summary: report.summary,
+          report: `${options.outputDir}/dry-run.md`,
+          json: `${options.outputDir}/dry-run.json`,
+          proposed: report.proposed,
+        });
+        if (!report.complete) process.exitCode = 2;
+        if (store && runId)
+          await store.finishRun(runId, report.complete ? 'completed' : 'error', report.summary);
+      } catch (error) {
+        if (store && runId)
+          await store.finishRun(runId, 'error', { message: 'メール取得・選別失敗' });
+        throw error;
+      } finally {
+        await unlock?.();
+      }
+    }),
+  );
 
 program
   .command('audit-forwards')
@@ -213,23 +289,82 @@ calendarCommands
   .option('--auth-file <file>', 'ローカルOAuth情報', DEFAULT_AUTH_FILE)
   .option('--apply', '重複していない未来の確定候補を実際に登録', false)
   .option('--output <file>', '照合・登録結果のJSON', 'reports/calendar-sync.json')
-  .action(async (options) => {
-    const selection = await readSelection(options.report);
-    const api = new GoogleCalendar(await createGoogleAuth(options.authFile), options.calendarId);
-    const result = await syncCalendarToFile(selection, api, options);
-    const counts: Record<string, number> = {};
-    for (const row of result.rows) counts[row.action] = (counts[row.action] ?? 0) + 1;
-    output({
-      mode: result.mode,
-      complete: result.complete,
-      calendarId: result.calendarId,
-      calendarWrites: result.calendarWrites,
-      pastSkipped: result.pastSkippedAtRead,
-      summary: counts,
-      output: result.output,
-    });
-    if (!result.complete || counts.possible_duplicate) process.exitCode = 2;
-  });
+  .option('--database', 'PostgreSQLへ照合・登録結果を保存（既定で有効）', true)
+  .option('--no-database', 'DBを使わずJSONのみ保存')
+  .option('--fail-on-hold', '重複の可能性による保留も終了コード2にする', false)
+  .action(async (options) =>
+    withTracking(options.database, async (store) => {
+      const selection = await readSelection(options.report);
+      const savedAuth = await readGoogleAuth(options.authFile);
+      const target = calendarTarget(savedAuth.refresh_token, options.calendarId);
+      const unlock = await store?.lock(`calendar:${target}`);
+      let runId: number | undefined;
+      try {
+        runId = await store?.startRun(
+          options.apply ? 'calendar:apply' : 'calendar:preview',
+          target,
+        );
+        const report = JSON.parse(await readFile(options.report, 'utf8'));
+        const sourceScope =
+          report.sourceScope ?? mailScope(mailAccount(), report.mailbox, report.uidValidity);
+        if (store) await store.requireSourceMails(sourceScope, selection.events);
+        const api = new GoogleCalendar(
+          await createGoogleAuth(options.authFile),
+          options.calendarId,
+        );
+        const result = await syncCalendarToFile(selection, api, {
+          ...options,
+          resolution: store ? (event) => store.resolution(target, event.eventKey) : undefined,
+          checkpoint:
+            store && runId
+              ? async (rows) => {
+                  const row = rows.at(-1)!;
+                  const selected = selection.events.find((e) => e.eventKey === row.eventKey)!;
+                  // Preview never overwrites the operational state or applies manual decisions to Google.
+                  if (options.apply)
+                    await store.saveSync(
+                      runId!,
+                      target,
+                      options.calendarId,
+                      sourceScope,
+                      selected,
+                      row,
+                    );
+                }
+              : undefined,
+        });
+        const counts: Record<string, number> = {};
+        for (const row of result.rows) counts[row.action] = (counts[row.action] ?? 0) + 1;
+        output({
+          mode: result.mode,
+          complete: result.complete,
+          calendarId: result.calendarId,
+          calendarWrites: result.calendarWrites,
+          pastSkipped: result.pastSkippedAtRead,
+          summary: counts,
+          output: result.output,
+        });
+        if (store && runId)
+          await store.finishRun(
+            runId,
+            !result.complete
+              ? 'error'
+              : counts.possible_duplicate
+                ? 'needs_attention'
+                : 'completed',
+            counts,
+          );
+        if (!result.complete || (options.failOnHold && counts.possible_duplicate))
+          process.exitCode = 2;
+      } catch (error) {
+        if (store && runId)
+          await store.finishRun(runId, 'error', { message: 'カレンダー照合・登録失敗' });
+        throw error;
+      } finally {
+        await unlock?.();
+      }
+    }),
+  );
 calendarCommands
   .command('export-ics')
   .description('選別済みの未来の確定候補をICSへ出力（OAuth不要）')
@@ -250,6 +385,7 @@ try {
     process.env.GOOGLE_OAUTH_JSON,
     process.env.GOOGLE_CLIENT_SECRET,
     process.env.GOOGLE_REFRESH_TOKEN,
+    process.env.DATABASE_URL,
   ]) {
     if (secret) message = message.split(secret).join('[REDACTED]');
   }

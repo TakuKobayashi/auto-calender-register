@@ -200,6 +200,7 @@ export type SyncRow = {
     | 'possible_duplicate'
     | 'previously_deleted'
     | 'past'
+    | 'skipped'
     | 'error';
   googleEventId?: string;
   reason?: string;
@@ -211,6 +212,9 @@ export async function syncCalendar(
     apply: boolean;
     now?: () => Date;
     checkpoint?: (rows: SyncRow[]) => Promise<void>;
+    resolution?: (
+      selected: SelectedEvent,
+    ) => Promise<{ resolution: string | null; resolvedGoogleEventId: string | null } | undefined>;
   },
 ) {
   const rows: SyncRow[] = [];
@@ -223,12 +227,28 @@ export async function syncCalendar(
       action: 'error',
     };
     try {
-      if (Date.parse(selected.payload.start.dateTime) <= clock().getTime()) row.action = 'past';
+      const resolution = await options.resolution?.(selected);
+      if (resolution?.resolution === 'skip') row.action = 'skipped';
+      else if (resolution?.resolution === 'duplicate') {
+        const linked = resolution.resolvedGoogleEventId
+          ? await port.get(resolution.resolvedGoogleEventId)
+          : null;
+        if (!linked || linked.status === 'cancelled') {
+          row.action = 'possible_duplicate';
+          row.reason = '手動照合先が存在しないか削除済みです。再確認してください。';
+        } else {
+          row.action = 'duplicate';
+          row.googleEventId = linked.id;
+        }
+      } else if (Date.parse(selected.payload.start.dateTime) <= clock().getTime())
+        row.action = 'past';
       else {
         const match = await findExisting(port, selected, withinBatch);
         if (match) {
           row.action = match.kind;
           row.googleEventId = match.event.id;
+          if (match.kind === 'possible_duplicate')
+            row.reason = `既存予定「${match.event.summary ?? '(タイトルなし)'}」との日時・タイトル・場所の照合で重複の可能性があります。`;
         } else if (Date.parse(selected.payload.start.dateTime) <= clock().getTime())
           row.action = 'past';
         else if (!options.apply) {
@@ -277,6 +297,10 @@ export async function syncCalendarToFile(
     apply: boolean;
     calendarId: string;
     output: string;
+    checkpoint?: (rows: SyncRow[]) => Promise<void>;
+    resolution?: (
+      selected: SelectedEvent,
+    ) => Promise<{ resolution: string | null; resolvedGoogleEventId: string | null } | undefined>;
   },
 ) {
   const target = resolve(options.output);
@@ -300,7 +324,11 @@ export async function syncCalendarToFile(
   await write([], false);
   const rows = await syncCalendar(selection, port, {
     apply: options.apply,
-    checkpoint: (rows) => write(rows, false).then(() => {}),
+    resolution: options.resolution,
+    checkpoint: async (rows) => {
+      await options.checkpoint?.(rows);
+      await write(rows, false);
+    },
   });
   const result = await write(
     rows,

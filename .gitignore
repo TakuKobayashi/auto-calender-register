@@ -10,4 +10,5 @@ credentials.json
 client_secret*.json
 token.json
 *.log
+db/dumps/
 

@@ -2,6 +2,15 @@ import { DateTime } from 'luxon';
 import * as chrono from 'chrono-node';
 import type { CollectedMail } from './collect.js';
 import type { EventPlan, MailPlan } from './classify.js';
+import { createHash } from 'node:crypto';
+
+// Include the actual prompt/schema and full input, so changes invalidate saved inference.
+export function extractionCacheKey(mail: CollectedMail, model: string, modelDigest: string) {
+  const { flags: _flags, size: _size, ...input } = mail;
+  return createHash('sha256')
+    .update(JSON.stringify({ instructions, extractionSchema, input, model, modelDigest }))
+    .digest('hex');
+}
 
 export type Intent = 'confirmed' | 'pending' | 'cancelled' | 'marketing' | 'not_event' | 'unclear';
 export type Extraction = {
@@ -69,21 +78,25 @@ export const extractionSchema = {
   required: ['intent', 'reason', 'evidence', 'events'],
 };
 
-const checkedModels = new Set<string>();
-async function checkLocalModel(model: string) {
-  if (checkedModels.has(model)) return;
+const checkedModels = new Map<string, string>();
+export async function localModelDigest(model: string): Promise<string> {
+  const checked = checkedModels.get(model);
+  if (checked) return checked;
   const tagsResponse = await fetch('http://127.0.0.1:11434/api/tags', {
     signal: AbortSignal.timeout(10_000),
   });
   if (!tagsResponse.ok) throw new Error('ローカルモデル一覧を取得できません。');
-  const tags = (await tagsResponse.json()) as { models?: { name: string; model: string }[] };
-  if (
-    !tags.models?.some(
-      (m) => [m.name, m.model].includes(model) || [m.name, m.model].includes(`${model}:latest`),
-    )
-  ) {
+  const tags = (await tagsResponse.json()) as {
+    models?: { name: string; model: string; digest?: string }[];
+  };
+  const installed = tags.models?.find(
+    (m) => [m.name, m.model].includes(model) || [m.name, m.model].includes(`${model}:latest`),
+  );
+  if (!installed) {
     throw new Error('ダウンロード済みのローカルモデルだけを指定してください。');
   }
+  if (!installed.digest || !/^(?:sha256:)?[a-f0-9]{64}$/i.test(installed.digest))
+    throw new Error('ローカルモデルのdigestを確認できません。古い抽出キャッシュは使用しません。');
   const response = await fetch('http://127.0.0.1:11434/api/show', {
     method: 'POST',
     body: JSON.stringify({ model }),
@@ -101,7 +114,8 @@ async function checkLocalModel(model: string) {
   if (info.thinking?.values && !info.thinking.values.includes(false)) {
     throw new Error('思考出力を無効にできないモデルはこの抽出処理の対象外です。');
   }
-  checkedModels.add(model);
+  checkedModels.set(model, installed.digest);
+  return installed.digest;
 }
 
 export function unwrapForward(mail: CollectedMail): CollectedMail {
@@ -193,7 +207,7 @@ export async function extractWithOllama(
   const text = modelText(mail);
   if (!text) throw new Error('本文を解析できません。広告と判断せず保留します。');
   if (text.length > 24_000) throw new Error('本文がLLMの入力上限を超えています（省略せず保留）。');
-  await checkLocalModel(model);
+  await localModelDigest(model);
   const unwrapped = unwrapForward(mail);
   const response = await fetch('http://127.0.0.1:11434/api/chat', {
     method: 'POST',

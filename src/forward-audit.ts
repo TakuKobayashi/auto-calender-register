@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { classifyMail, finalize } from './classify.js';
@@ -6,6 +5,8 @@ import { listSinceMail, mailboxInfo, parseMail, withMailbox } from './mail.js';
 import type { CollectedMail, Collection } from './collect.js';
 import {
   extractWithOllama,
+  extractionCacheKey,
+  localModelDigest,
   extractionToPlan,
   modelText,
   unwrapForward,
@@ -165,9 +166,11 @@ export async function auditForwards(
       console.error(`Ollama検証 ${modelCalls}: Sent UID ${forwarded.uid} (${options.model})`);
       const begin = Date.now();
       try {
-        const key = createHash('sha256')
-          .update(JSON.stringify({ prompt: 2, model: options.model, source }))
-          .digest('hex');
+        const key = extractionCacheKey(
+          source,
+          options.model,
+          await localModelDigest(options.model),
+        );
         const extraction = inferenceCache[key] ?? (await extractWithOllama(source, options.model));
         inferenceCache[key] = extraction;
         row.llm = {
