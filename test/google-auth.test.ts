@@ -8,6 +8,7 @@ import {
   validateSavedAuth,
   validOAuthState,
   loginGoogle,
+  readGoogleClient,
 } from '../src/google-auth.js';
 import { OAuth2Client, CodeChallengeMethod } from 'google-auth-library';
 
@@ -44,6 +45,76 @@ test('GitHub SecretのJSONと個別環境変数から認証情報を読み込め
       return true;
     },
   );
+});
+
+test('初回認証は.envのID・シークレットだけで開始でき、トークンもJSONも不要', async () => {
+  assert.deepEqual(
+    await readGoogleClient(undefined, {
+      GOOGLE_CLIENT_ID: ' test-client ',
+      GOOGLE_CLIENT_SECRET: ' test-secret ',
+    }),
+    {
+      client_id: 'test-client',
+      client_secret: 'test-secret',
+    },
+  );
+  await assert.rejects(
+    readGoogleClient(undefined, { GOOGLE_CLIENT_ID: 'sensitive-test-client' }),
+    (error) => {
+      assert.match(String(error), /両方設定/);
+      assert.doesNotMatch(String(error), /sensitive-test-client/);
+      return true;
+    },
+  );
+});
+
+test('明示したクライアントJSONを優先し、初回認証後は.envの2項目と保存済みトークンを併用', async () => {
+  const parent = resolve('reports');
+  await mkdir(parent, { recursive: true });
+  const directory = await mkdtemp(join(parent, 'oauth-config-test-'));
+  try {
+    const clientFile = join(directory, 'client.json'),
+      authFile = join(directory, 'auth.json');
+    await writeFile(
+      clientFile,
+      JSON.stringify({
+        installed: { client_id: saved.client_id, client_secret: saved.client_secret },
+      }),
+    );
+    assert.deepEqual(
+      await readGoogleClient(clientFile, {
+        GOOGLE_CLIENT_ID: 'other-client',
+        GOOGLE_CLIENT_SECRET: 'other-secret',
+      }),
+      {
+        client_id: saved.client_id,
+        client_secret: saved.client_secret,
+      },
+    );
+    await writeFile(authFile, JSON.stringify(saved));
+    assert.deepEqual(
+      await readGoogleAuth(authFile, {
+        GOOGLE_CLIENT_ID: saved.client_id,
+        GOOGLE_CLIENT_SECRET: saved.client_secret,
+        GOOGLE_REFRESH_TOKEN: '',
+      }),
+      saved,
+    );
+    await assert.rejects(
+      readGoogleAuth(authFile, {
+        GOOGLE_CLIENT_ID: 'different-client',
+        GOOGLE_CLIENT_SECRET: saved.client_secret,
+      }),
+    );
+    await writeFile(
+      clientFile,
+      JSON.stringify({ web: { client_id: saved.client_id, client_secret: saved.client_secret } }),
+    );
+    await assert.rejects(readGoogleClient(clientFile, {}), /デスクトップアプリ/);
+  } finally {
+    assert.equal(dirname(directory), parent);
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('OAuthのstateが一致しないコールバックを拒否', () => {

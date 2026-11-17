@@ -166,8 +166,7 @@ authCommands
   .description('ブラウザーでGoogle OAuth認証（初回のみ）')
   .option(
     '--client-file <file>',
-    'デスクトップアプリ用OAuthクライアントJSON',
-    '.secrets/google-client.json',
+    'デスクトップアプリ用JSON（省略時は環境変数、次に .secrets/google-client.json）',
   )
   .option('--auth-file <file>', 'リフレッシュトークンの保存先', DEFAULT_AUTH_FILE)
   .option('--no-browser', 'ブラウザーを自動起動せずURLを表示')

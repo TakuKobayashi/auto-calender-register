@@ -43,7 +43,7 @@ export function validateSavedAuth(value: unknown): SavedGoogleAuth {
 export async function readGoogleAuth(file = DEFAULT_AUTH_FILE, env = process.env) {
   try {
     if (env.GOOGLE_OAUTH_JSON) return validateSavedAuth(JSON.parse(env.GOOGLE_OAUTH_JSON));
-    if (env.GOOGLE_CLIENT_ID || env.GOOGLE_CLIENT_SECRET || env.GOOGLE_REFRESH_TOKEN) {
+    if (env.GOOGLE_REFRESH_TOKEN?.trim()) {
       return validateSavedAuth({
         version: 1,
         client_id: env.GOOGLE_CLIENT_ID,
@@ -51,10 +51,52 @@ export async function readGoogleAuth(file = DEFAULT_AUTH_FILE, env = process.env
         refresh_token: env.GOOGLE_REFRESH_TOKEN,
       });
     }
-    return validateSavedAuth(JSON.parse(await readFile(file, 'utf8')));
+    const saved = validateSavedAuth(JSON.parse(await readFile(file, 'utf8')));
+    if (
+      (env.GOOGLE_CLIENT_ID?.trim() && env.GOOGLE_CLIENT_ID.trim() !== saved.client_id) ||
+      (env.GOOGLE_CLIENT_SECRET?.trim() && env.GOOGLE_CLIENT_SECRET.trim() !== saved.client_secret)
+    ) {
+      throw new Error('OAuthクライアントの設定が保存済みの認証情報と一致しません。');
+    }
+    return saved;
   } catch {
     throw new Error(
       'Google OAuth情報を読み込めません。auth loginを実行するかGOOGLE_OAUTH_JSONを設定してください。',
+    );
+  }
+}
+
+export async function readGoogleClient(
+  clientFile?: string,
+  env = process.env,
+): Promise<{ client_id: string; client_secret: string }> {
+  if (!clientFile && (env.GOOGLE_CLIENT_ID?.trim() || env.GOOGLE_CLIENT_SECRET?.trim())) {
+    if (!env.GOOGLE_CLIENT_ID?.trim() || !env.GOOGLE_CLIENT_SECRET?.trim()) {
+      throw new Error(
+        '.env の GOOGLE_CLIENT_ID と GOOGLE_CLIENT_SECRET を両方設定してください。初回認証ではGOOGLE_REFRESH_TOKENは不要です。',
+      );
+    }
+    return {
+      client_id: env.GOOGLE_CLIENT_ID.trim(),
+      client_secret: env.GOOGLE_CLIENT_SECRET.trim(),
+    };
+  }
+  try {
+    const raw = JSON.parse(await readFile(clientFile ?? '.secrets/google-client.json', 'utf8'));
+    if (
+      typeof raw.installed?.client_id !== 'string' ||
+      !raw.installed.client_id.trim() ||
+      typeof raw.installed?.client_secret !== 'string' ||
+      !raw.installed.client_secret.trim()
+    )
+      throw new Error();
+    return {
+      client_id: raw.installed.client_id.trim(),
+      client_secret: raw.installed.client_secret.trim(),
+    };
+  } catch {
+    throw new Error(
+      'Google OAuthクライアントが未設定です。.envにGOOGLE_CLIENT_IDとGOOGLE_CLIENT_SECRETを設定するか、デスクトップアプリ用JSONを --client-file で指定してください。',
     );
   }
 }
@@ -83,20 +125,11 @@ export function validOAuthState(received: string | null, expected: string) {
 }
 
 export async function loginGoogle(options: {
-  clientFile: string;
+  clientFile?: string;
   authFile: string;
   browser: boolean;
 }) {
-  let installed: { client_id: string; client_secret: string };
-  try {
-    const raw = JSON.parse(await readFile(options.clientFile, 'utf8'));
-    if (!raw.installed?.client_id || !raw.installed?.client_secret) throw new Error();
-    installed = raw.installed;
-  } catch {
-    throw new Error(
-      'デスクトップアプリ用OAuthクライアントJSONを --client-file で指定してください。',
-    );
-  }
+  const installed = await readGoogleClient(options.clientFile);
   const state = randomBytes(32).toString('hex');
   const server = createServer();
   await new Promise<void>((resolve, reject) => {

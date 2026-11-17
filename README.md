@@ -7,6 +7,17 @@ Google OAuthとGitHub Secretsは利用者側の設定が必要です。GitHub Ac
 
 Googleへの登録・OAuth・ICS・GitHub Secretsの手順は [Googleカレンダー連携ガイド](docs/google-calendar.md) を参照してください。
 
+初回のOAuth認証後、メール取得・LLMによる選別からGoogleカレンダー登録までを一括実行できます。
+Ollamaを起動し、`qwen3.5:9b` を取得済みの状態で実行してください。
+
+```sh
+npm run task calendar:sync
+```
+
+接続確認→新しいメールの取得・選別→ICS出力→Googleの重複照合・登録の順に実行します。
+開始日は標準で先月初日、登録先はメインカレンダーです。未確定・要確認・既存予定は追加しません。
+途中の処理が失敗した場合は停止し、古い選別結果を使って登録を続けません。
+
 ## セットアップ
 
 Node.js 22以上とnpmが必要です。

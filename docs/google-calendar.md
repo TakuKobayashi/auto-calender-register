@@ -6,6 +6,26 @@
 
 ## 最初に使うコマンド
 
+**OAuth認証後は、次の1コマンドでメール取得・選別からGoogle登録まで進みます。**
+
+```powershell
+npm run task calendar:sync
+```
+
+Ollamaの起動と `qwen3.5:9b` の取得を済ませてください。
+接続確認→指定期間のメールを新しく取得→LLMで選別→ICS生成→Googleの既存予定と照合→新規登録の順です。
+日付指定がなければ先月初日以降を対象とし、カレンダー指定がなければ `primary` へ登録します。
+未確定・根拠不足・既存予定は登録せず、途中の処理が失敗した場合は停止します。
+多数のメールを対象にするとLLMの処理に時間がかかります。
+
+期間・登録先・モデルはTaskの引数で指定できます。環境変数にカレンダーIDを設定する必要はありません。
+
+```powershell
+npm run task calendar:sync SINCE=2026-11-01 CALENDAR_ID=YOUR_CALENDAR_ID MODEL=qwen3.5:9b
+```
+
+以下は、初回認証や、各処理だけを個別に実行する場合のコマンドです。
+
 ```powershell
 # OAuth不要: 他のカレンダーに取り込めるICSへ出力
 npm run calendar:ics
@@ -17,7 +37,7 @@ npm run auth:status
 # Googleカレンダーの既存予定と照合するだけ（書き込み0件）
 npm run calendar:plan
 
-# 重複していない候補を実際に登録
+# 既に選別済みの候補だけを登録（メールの再取得・再選別はしない）
 npm run calendar:register
 ```
 
@@ -32,12 +52,22 @@ npm run calendar:register
 3. 「Google Auth Platform」でアプリ名・連絡先等を設定します。個人のGmailで使う場合は外部ユーザー向けに設定し、テスト段階では自分のGoogleアカウントをテストユーザーへ追加します。
 4. データアクセスのスコープに `https://www.googleapis.com/auth/calendar.events` を設定します。メール送信やGmail本文を読む権限は使いません。
 5. 「クライアント」からOAuthクライアントを作成し、アプリケーションの種類を **デスクトップアプリ** にします。Webアプリ用ではありません。
-6. ダウンロードしたJSONを、このプロジェクトの `.secrets/google-client.json` に保存します。
+6. クライアントIDとクライアントシークレットを `.env` の `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` に設定します。または、ダウンロードしたJSONを `.secrets/google-client.json` に保存します。
 
 `.secrets` フォルダーは必要に応じて作成してください。OAuthクライアントJSONやトークンをチャット・Gitへ貼り付ける必要はありません。
 公式の [Calendar API Node.jsクイックスタート](https://developers.google.com/workspace/calendar/api/quickstart/nodejs) にもAPI有効化とデスクトップクライアント作成の手順があります。
 
 ## ローカルでOAuthを完了する
+
+`.env` にデスクトップアプリ用OAuthクライアントの情報を設定した場合は、JSONファイルなしで実行できます。
+
+```dotenv
+GOOGLE_CLIENT_ID=取得したクライアントID
+GOOGLE_CLIENT_SECRET=取得したクライアントシークレット
+```
+
+初回認証に `GOOGLE_REFRESH_TOKEN` は不要です。未設定・空欄にしてください。
+`--client-file` を明示した場合はそのファイルを優先し、省略時は上記2環境変数、次に `.secrets/google-client.json` を使います。
 
 ```powershell
 npm run auth:login
@@ -139,7 +169,9 @@ GitHubの画面では「Settings → Secrets and variables → Actions → New r
 
 他のSecrets管理サービスでも、実行環境の `GOOGLE_OAUTH_JSON` に同じJSONを渡せば使えます。
 代わりに `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REFRESH_TOKEN` の3環境変数でも渡せます。
-優先順位はJSON環境変数→3環境変数→ローカル認証ファイルです。個別変数方式は3つすべて必要です。
+通常実行時の優先順位はJSON環境変数→リフレッシュトークンを含む3環境変数→ローカル認証ファイルです。
+クライアントID・シークレットだけを `.env` に置いた場合は、`auth:login` が保存したファイルのトークンを使用します。
+`.env` のクライアント情報と保存済みファイルが異なる場合は再認証してください。
 JSONはBase64ではなく、そのままのJSON文字列を渡します。
 
 公式: [GitHub Actions Secretsの設定](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets)。

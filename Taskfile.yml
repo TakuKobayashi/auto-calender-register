@@ -1,6 +1,19 @@
 ﻿version: '3'
 
 tasks:
+  calendar:sync:
+    desc: 接続確認→メール取得・LLM選別→ICS出力→重複照合・Google登録を一括実行
+    vars:
+      MODEL: '{{default "qwen3.5:9b" .MODEL}}'
+      SINCE: '{{default "" .SINCE}}'
+      CALENDAR_ID: '{{default "primary" .CALENDAR_ID}}'
+    cmds:
+      - npm run auth:status -- --calendar-id "{{.CALENDAR_ID}}"
+      - >-
+        npm run calendar:dry-run -- --ollama-model "{{.MODEL}}"
+        {{if .SINCE}}--since "{{.SINCE}}"{{end}}
+      - npm run calendar:ics
+      - npm run calendar:register -- --calendar-id "{{.CALENDAR_ID}}"
   mail:review:
     desc: 接続確認→一覧→最新3件の本文取得を順番に実行
     cmds:
