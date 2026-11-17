@@ -1,0 +1,103 @@
+name: Mail calendar
+
+on:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: '受信開始日 YYYY-MM-DD（空欄は先月初日）'
+        required: false
+        type: string
+      apply:
+        description: 'Googleカレンダーへ実際に登録する'
+        type: boolean
+        default: false
+      model:
+        description: 'Ollamaモデル（空欄はルール方式のみ）'
+        type: string
+        default: 'qwen3.5:9b'
+  # 定期実行を始める場合に有効化。schedule時の書き込みは下のREGISTER_ON_SCHEDULEで制御。
+  # schedule:
+  #   - cron: '17 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mail-calendar
+  cancel-in-progress: false
+
+jobs:
+  calendar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      YAHOO_IMAP_USER: ${{ secrets.YAHOO_IMAP_USER }}
+      YAHOO_IMAP_PASSWORD: ${{ secrets.YAHOO_IMAP_PASSWORD }}
+      YAHOO_IMAP_HOST: imap.mail.yahoo.co.jp
+      YAHOO_IMAP_PORT: '993'
+      YAHOO_IMAP_MAILBOX: ${{ vars.YAHOO_IMAP_MAILBOX || 'INBOX' }}
+      GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
+      GOOGLE_CALENDAR_ID: ${{ vars.GOOGLE_CALENDAR_ID || 'primary' }}
+      OLLAMA_MODEL: ${{ inputs.model }}
+      OLLAMA_TIMEOUT_MS: '600000'
+      OLLAMA_NUM_PARALLEL: '1'
+      OLLAMA_MAX_LOADED_MODELS: '1'
+      SCAN_SINCE: ${{ inputs.since }}
+      APPLY: ${{ inputs.apply }}
+      REGISTER_ON_SCHEDULE: 'false'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Scheduled model
+        if: github.event_name == 'schedule'
+        run: echo 'OLLAMA_MODEL=qwen3.5:9b' >> "$GITHUB_ENV"
+      - name: Check required secrets
+        shell: bash
+        run: |
+          test -n "$YAHOO_IMAP_USER" && test -n "$YAHOO_IMAP_PASSWORD" && test -n "$GOOGLE_OAUTH_JSON" || {
+            echo 'Required secrets: YAHOO_IMAP_USER, YAHOO_IMAP_PASSWORD, GOOGLE_OAUTH_JSON'
+            exit 1
+          }
+      - name: Cache local model
+        if: env.OLLAMA_MODEL != ''
+        uses: actions/cache@v6
+        with:
+          path: ~/.ollama/models
+          key: ollama-${{ runner.os }}-${{ runner.arch }}-${{ env.OLLAMA_MODEL }}
+      - name: Start local Ollama
+        if: env.OLLAMA_MODEL != ''
+        shell: bash
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          mkdir -p reports
+          ollama serve > reports/ollama.log 2>&1 &
+          ready=false
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then ready=true; break; fi
+            sleep 2
+          done
+          test "$ready" = true
+          ollama pull "$OLLAMA_MODEL"
+      - name: Collect and classify
+        shell: bash
+        run: |
+          mkdir -p reports
+          args=(--import tsx src/cli.ts dry-run)
+          if [[ -n "$SCAN_SINCE" ]]; then args+=(--since "$SCAN_SINCE"); fi
+          if [[ -n "$OLLAMA_MODEL" ]]; then args+=(--ollama-model "$OLLAMA_MODEL"); fi
+          node "${args[@]}" > reports/selection-summary.json
+      - name: Export ICS
+        run: node --import tsx src/cli.ts calendar export-ics
+      - name: Compare or register Google events
+        shell: bash
+        run: |
+          args=(--import tsx src/cli.ts calendar sync)
+          if [[ "$APPLY" = true ]] || [[ "$GITHUB_EVENT_NAME" = schedule && "$REGISTER_ON_SCHEDULE" = true ]]; then
+            args+=(--apply)
+          fi
+          node "${args[@]}"
+      # reports/にはメール本文と予定が含まれるため、公開ログやArtifactsにはアップロードしない。

@@ -10,6 +10,7 @@ export type EventPlan = {
   start: string | null;
   end: string | null;
   timeZone: string | null;
+  endTimeZone?: string | null;
   location: string;
   evidence: string;
   reasons: string[];
@@ -145,7 +146,12 @@ export function finalize(plan: EventPlan, now: Date, mail: CollectedMail): Event
       location: plan.location,
       description: `メールから抽出した予定\n元メールUID: ${mail.uid}\nMessage-ID: ${mail.messageId ?? ''}\n根拠: ${plan.evidence}\n${plan.reasons.join('\n')}`,
       start: { dateTime: plan.start, ...zone },
-      end: { dateTime: plan.end, ...zone },
+      end: {
+        dateTime: plan.end,
+        ...(plan.endTimeZone && !plan.endTimeZone.startsWith('UTC')
+          ? { timeZone: plan.endTimeZone }
+          : zone),
+      },
       extendedProperties: { private: { sourceEventKey: plan.eventKey } },
     };
   }

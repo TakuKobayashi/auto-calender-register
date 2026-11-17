@@ -8,10 +8,20 @@ import { collect } from './collect.js';
 import { readCollection, writeDryRun } from './dry-run.js';
 import { auditForwards, collectForwards, type ForwardCache } from './forward-audit.js';
 import { readFile } from 'node:fs/promises';
+import {
+  loginGoogle,
+  createGoogleAuth,
+  readGoogleAuth,
+  writeGoogleAuth,
+  DEFAULT_AUTH_FILE,
+} from './google-auth.js';
+import { readSelection } from './selection.js';
+import { exportIcs } from './ics.js';
+import { GoogleCalendar, syncCalendarToFile } from './google-calendar.js';
 
 const program = new Command()
   .name('yahoo-mail')
-  .description('Yahoo! JAPANメールを読み取り専用で取得（JSON出力）')
+  .description('Yahoo! JAPANメールの予定抽出・Googleカレンダー登録・ICS出力')
   .version('0.1.0');
 
 const output = (value: unknown) => console.log(JSON.stringify(value, null, 2));
@@ -148,12 +158,100 @@ program
     if (report.llmErrors) process.exitCode = 2;
   });
 
+const authCommands = program
+  .command('auth')
+  .description('Google OAuthをローカルで認証し、CI用に保存');
+authCommands
+  .command('login')
+  .description('ブラウザーでGoogle OAuth認証（初回のみ）')
+  .option(
+    '--client-file <file>',
+    'デスクトップアプリ用OAuthクライアントJSON',
+    '.secrets/google-client.json',
+  )
+  .option('--auth-file <file>', 'リフレッシュトークンの保存先', DEFAULT_AUTH_FILE)
+  .option('--no-browser', 'ブラウザーを自動起動せずURLを表示')
+  .action(async (options) => {
+    const path = await loginGoogle(options);
+    output({
+      authenticated: true,
+      authFile: path,
+      message: '認証情報は表示しません。このJSONをGOOGLE_OAUTH_JSON Secretとして利用できます。',
+    });
+  });
+authCommands
+  .command('status')
+  .description('保存済み認証情報でCalendar APIへ接続確認')
+  .option('--auth-file <file>', 'ローカル認証情報', DEFAULT_AUTH_FILE)
+  .option('--calendar-id <id>', 'カレンダーID', process.env.GOOGLE_CALENDAR_ID || 'primary')
+  .action(async (options) => {
+    const api = new GoogleCalendar(await createGoogleAuth(options.authFile), options.calendarId);
+    const now = new Date();
+    await api.list({
+      timeMin: now.toISOString(),
+      timeMax: new Date(now.getTime() + 1000).toISOString(),
+    });
+    output({ authenticated: true, calendarId: options.calendarId, calendarWrites: 0 });
+  });
+authCommands
+  .command('export')
+  .description('GitHub Secrets等へ渡すOAuth JSONをファイルへ出力（コンソールには非表示）')
+  .option('--auth-file <file>', '元の認証情報', DEFAULT_AUTH_FILE)
+  .option('--output <file>', 'Secret用JSONの出力先', '.secrets/github-google-oauth.json')
+  .action(async (options) => {
+    const path = await writeGoogleAuth(options.output, await readGoogleAuth(options.authFile));
+    output({ output: path, secretName: 'GOOGLE_OAUTH_JSON' });
+  });
+
+const calendarCommands = program
+  .command('calendar')
+  .description('選別済み候補のGoogle登録・ICS出力');
+calendarCommands
+  .command('sync')
+  .description('Googleの既存予定と照合（--apply 指定時のみ新規登録）')
+  .option('--report <file>', '完了済み選別レポート', 'reports/dry-run.json')
+  .option('--calendar-id <id>', 'カレンダーID', process.env.GOOGLE_CALENDAR_ID || 'primary')
+  .option('--auth-file <file>', 'ローカルOAuth情報', DEFAULT_AUTH_FILE)
+  .option('--apply', '重複していない未来の確定候補を実際に登録', false)
+  .option('--output <file>', '照合・登録結果のJSON', 'reports/calendar-sync.json')
+  .action(async (options) => {
+    const selection = await readSelection(options.report);
+    const api = new GoogleCalendar(await createGoogleAuth(options.authFile), options.calendarId);
+    const result = await syncCalendarToFile(selection, api, options);
+    const counts: Record<string, number> = {};
+    for (const row of result.rows) counts[row.action] = (counts[row.action] ?? 0) + 1;
+    output({
+      mode: result.mode,
+      complete: result.complete,
+      calendarId: result.calendarId,
+      calendarWrites: result.calendarWrites,
+      pastSkipped: result.pastSkippedAtRead,
+      summary: counts,
+      output: result.output,
+    });
+    if (!result.complete || counts.possible_duplicate) process.exitCode = 2;
+  });
+calendarCommands
+  .command('export-ics')
+  .description('選別済みの未来の確定候補をICSへ出力（OAuth不要）')
+  .option('--report <file>', '完了済み選別レポート', 'reports/dry-run.json')
+  .option('--output <file>', 'ICS出力先', 'reports/events.ics')
+  .action(async (options) =>
+    output(await exportIcs(await readSelection(options.report), options.output)),
+  );
+
 try {
   await program.parseAsync();
 } catch (error) {
   // サーバー応答に含まれる可能性のある認証情報は表示しない。
   let message = error instanceof Error ? error.message : 'メール取得に失敗しました。';
-  for (const secret of [process.env.YAHOO_IMAP_PASSWORD, process.env.YAHOO_IMAP_USER]) {
+  for (const secret of [
+    process.env.YAHOO_IMAP_PASSWORD,
+    process.env.YAHOO_IMAP_USER,
+    process.env.GOOGLE_OAUTH_JSON,
+    process.env.GOOGLE_CLIENT_SECRET,
+    process.env.GOOGLE_REFRESH_TOKEN,
+  ]) {
     if (secret) message = message.split(secret).join('[REDACTED]');
   }
   console.error(`エラー: ${message}`);

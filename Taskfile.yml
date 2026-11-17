@@ -48,3 +48,23 @@ tasks:
     desc: Gmail宛の転送済みメールを取得して判定を監査（送信・登録なし）
     cmds:
       - npm run --silent cli -- audit-forwards
+  auth:login:
+    desc: Google OAuthをブラウザーで認証
+    cmds:
+      - npm run --silent cli -- auth login
+  auth:status:
+    desc: Google Calendar APIへの接続確認
+    cmds:
+      - npm run --silent cli -- auth status
+  calendar:plan:
+    desc: 選別済み候補をGoogleの既存予定と照合（書き込まない）
+    cmds:
+      - npm run --silent cli -- calendar sync
+  calendar:register:
+    desc: 重複していない未来の確定候補をGoogleカレンダーへ登録
+    cmds:
+      - npm run --silent cli -- calendar sync --apply
+  calendar:ics:
+    desc: 選別済み候補をICSファイルへ出力
+    cmds:
+      - npm run --silent cli -- calendar export-ics

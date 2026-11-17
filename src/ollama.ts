@@ -185,8 +185,10 @@ export function validateExtraction(value: unknown): Extraction {
 export async function extractWithOllama(
   mail: CollectedMail,
   model: string,
-  timeoutMs = 180_000,
+  timeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS ?? 180_000),
 ): Promise<Extraction> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 1800_000)
+    throw new Error('OLLAMA_TIMEOUT_MSは1000〜1800000の整数で指定してください。');
   // アカウント本文を外部ホストに送らないよう接続先はループバック固定。
   const text = modelText(mail);
   if (!text) throw new Error('本文を解析できません。広告と判断せず保留します。');
@@ -199,7 +201,7 @@ export async function extractWithOllama(
     signal: AbortSignal.timeout(timeoutMs),
     body: JSON.stringify({
       model,
-      stream: false,
+      stream: true,
       think: false,
       format: extractionSchema,
       options: { temperature: 0, seed: 42, num_ctx: 12288, num_predict: 2000 },
@@ -218,12 +220,49 @@ export async function extractWithOllama(
     }),
   });
   if (!response.ok) throw new Error(`Ollama応答エラー: HTTP ${response.status}`);
-  const result = (await response.json()) as {
-    message?: { content?: string };
-    done_reason?: string;
+  return validateExtraction(JSON.parse(await readOllamaChat(response)));
+}
+
+export async function readOllamaChat(response: Response): Promise<string> {
+  if (!response.body) throw new Error('Ollamaの応答本文が空です。');
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '',
+    content = '',
+    done = false;
+  const consume = (line: string) => {
+    if (!line.trim()) return;
+    const chunk = JSON.parse(line) as {
+      error?: string;
+      message?: { content?: string };
+      done?: boolean;
+      done_reason?: string;
+    };
+    if (chunk.error) throw new Error('Ollamaの生成中にエラーが発生しました。');
+    content += chunk.message?.content ?? '';
+    if (content.length > 2_000_000) throw new Error('Ollamaの出力上限を超えました。');
+    if (chunk.done_reason === 'length') throw new Error('LLM出力が上限に到達しました。');
+    if (chunk.done) done = true;
   };
-  if (result.done_reason === 'length') throw new Error('LLM出力が上限に到達しました。');
-  return validateExtraction(JSON.parse(result.message?.content ?? ''));
+  try {
+    for (;;) {
+      const part = await reader.read();
+      buffer += decoder.decode(part.value, { stream: !part.done });
+      let end: number;
+      while ((end = buffer.indexOf('\n')) !== -1) {
+        consume(buffer.slice(0, end));
+        buffer = buffer.slice(end + 1);
+      }
+      if (buffer.length > 2_000_000) throw new Error('Ollamaの応答行が大きすぎます。');
+      if (part.done) break;
+    }
+    if (buffer.trim()) consume(buffer);
+    if (!done || !content.trim()) throw new Error('Ollamaの応答が途中で終了しました。');
+    return content;
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
 }
 
 function quoteExists(text: string, quote: string) {
@@ -419,6 +458,7 @@ export function extractionToPlan(
         end: end?.toISO() ?? null,
         localStart: e.startLocal ?? undefined,
         timeZone: start?.zoneName ?? null,
+        endTimeZone: end?.zoneName ?? null,
         location: e.location,
         evidence: [startEvidence, endEvidence, zoneEvidence, confirmationEvidence].join('\n'),
         reasons,
