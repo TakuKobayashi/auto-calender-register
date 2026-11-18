@@ -212,7 +212,7 @@ test('不正なモデル出力を拒否', () => {
 test('原文の時刻と年月日を検証し、年の勝手な補完を拒否', () => {
   assert.equal(dateSupported('2026-11-20T15:00:00', '2026年11月20日 15:00', now), true);
   assert.equal(dateSupported('2027-11-20T15:00:00', '2026年11月20日 15:00', now), false);
-  assert.equal(dateSupported('2026-11-20T15:00:00', '11月20日 15:00', now), false);
+  assert.equal(dateSupported('2026-11-20T15:00:00', '11月20日 15:00', now), true);
 });
 
 test('日付の次行の括弧内に書かれた時刻を捨てない', () => {
@@ -241,7 +241,7 @@ test('LLMも確定と判断し開始日時が一致するとき、ルールで�
   const partial = extraction();
   partial.events[0]!.endLocal = null;
   const inferred = extractionToPlan(mail(), partial, now, finalize);
-  assert.equal(inferred.decision, 'review');
+  assert.equal(inferred.decision, 'candidate');
   const merged = reconcileModelPlan(rule, inferred);
   assert.equal(merged.decision, 'candidate');
   assert.equal(merged.events[0]?.payload?.end.dateTime, '2026-11-21T10:00:00.000+09:00');

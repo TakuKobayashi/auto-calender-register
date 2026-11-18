@@ -4,7 +4,6 @@ import { positiveInteger } from './config.js';
 import { getMail, listMail, mailboxInfo, withMailbox } from './mail.js';
 import { DateTime } from 'luxon';
 import { parseSince } from './classify.js';
-import { collect } from './collect.js';
 import { readCollection, writeDryRun } from './dry-run.js';
 import { auditForwards, collectForwards, type ForwardCache } from './forward-audit.js';
 import { readFile } from 'node:fs/promises';
@@ -18,7 +17,9 @@ import {
 import { readSelection } from './selection.js';
 import { exportIcs } from './ics.js';
 import { GoogleCalendar, syncCalendarToFile } from './google-calendar.js';
-import { Store, mailScope, calendarTarget } from './db/store.js';
+import { Store, calendarTarget } from './db/store.js';
+import { mergeMessages, sourceScope, mailLabel } from './domain/mail.js';
+import { collectYahoo, yahooAccount, normalizeYahooCache } from './sources/yahoo.js';
 import { DrizzleQueryError } from 'drizzle-orm';
 
 async function withTracking<T>(enabled: boolean, action: (store?: Store) => Promise<T>) {
@@ -43,8 +44,7 @@ async function withTracking<T>(enabled: boolean, action: (store?: Store) => Prom
     }
   }
 }
-const mailAccount = () =>
-  `${process.env.YAHOO_IMAP_HOST || 'imap.mail.yahoo.co.jp'}:${(process.env.YAHOO_IMAP_USER ?? '').trim().toLowerCase()}`;
+const mailAccount = yahooAccount;
 
 const program = new Command()
   .name('yahoo-mail')
@@ -125,46 +125,34 @@ program
   .option('--no-database', 'DBを使わずJSONのみ保存')
   .action(async (options) =>
     withTracking(options.database, async (store) => {
-      const unlock = await store?.lock(
-        `mail:${mailAccount()}:${options.mailbox || process.env.YAHOO_IMAP_MAILBOX || 'INBOX'}`,
-      );
+      const unlock = await store?.lock(`mail:${mailAccount().provider}:${mailAccount().key}`);
       let runId: number | undefined;
       try {
-        runId = await store?.startRun('mail', mailAccount());
+        runId = await store?.startRun('mail', `${mailAccount().provider}:${mailAccount().key}`);
         const since = parseSince(options.since);
         const collection = options.fromCache
-          ? await readCollection(options.fromCache, since)
-          : await withMailbox(options.mailbox, (client) => {
-              const info = mailboxInfo(client);
-              const scope = mailScope(mailAccount(), info.mailbox, info.uidValidity);
-              return collect(
-                client,
-                since,
-                options.outputDir,
-                options.maxBytes,
-                store ? { store, scope } : undefined,
-              );
-            });
+          ? normalizeYahooCache(await readCollection(options.fromCache, since), mailAccount())
+          : await collectYahoo(since, options.outputDir, options.maxBytes, options.mailbox, store);
         if (store && options.fromCache) {
-          collection.sourceScope = mailScope(
-            mailAccount(),
-            collection.mailbox,
-            collection.uidValidity,
+          collection.messages = mergeMessages(collection.messages);
+          const scopes = new Map(
+            collection.messages.map((m) => [sourceScope(m.source!), m.source!]),
           );
-          await store.ensureMailbox(collection.sourceScope, collection);
-          for (const mail of collection.messages)
-            await store.saveMail(collection.sourceScope, mail);
-          for (const error of collection.errors)
-            await store.fetchError(collection.sourceScope, error.uid, error.reason);
-          await store.completeScan(
-            collection.sourceScope,
-            Math.max(
-              0,
-              ...collection.messages.map((m) => m.uid),
-              ...collection.errors.map((e) => e.uid),
-            ),
-            collection.complete,
-          );
+          for (const [scope, source] of scopes) {
+            await store.ensureMailbox(scope, {
+              mailbox: source.name,
+              uidValidity: source.generation ?? '',
+              since: collection.since,
+              source,
+            });
+            const messages = collection.messages.filter((m) => sourceScope(m.source!) === scope);
+            for (const mail of messages) await store.saveMail(scope, mail);
+            await store.completeScan(
+              scope,
+              { lastMessageId: messages.at(-1)?.source?.messageId },
+              collection.complete,
+            );
+          }
         }
         const report = await writeDryRun(
           collection,
@@ -180,17 +168,28 @@ program
           complete: report.complete,
           calendarWrites: 0,
           calendarDuplicateCheck: report.calendarDuplicateCheck,
-          summary: report.summary,
+          summary: {
+            checked: report.summary.scanned,
+            register: report.summary.register,
+            doNotRegister: report.summary.skip,
+            errors: report.summary.error,
+          },
           report: `${options.outputDir}/dry-run.md`,
           json: `${options.outputDir}/dry-run.json`,
-          proposed: report.proposed,
+          proposed: report.proposed.map((p) => ({
+            shouldRegister: true,
+            from: p.sourceFrom,
+            subject: p.sourceSubject,
+            title: p.payload!.summary,
+            start: p.payload!.allDayDate ?? p.payload!.start.dateTime,
+          })),
         });
         if (!report.complete) {
           console.error(
             `メール選別が未完了のため停止しました。取得・解析エラー ${report.summary.error}件。詳細: ${options.outputDir}/dry-run.md`,
           );
           for (const mail of report.messages.filter((m) => m.decision === 'error'))
-            console.error(`UID ${mail.uid}: ${mail.reasons.join(' / ')}`);
+            console.error(`${mailLabel(mail)}: ${mail.reasons.join(' / ')}`);
           process.exitCode = 2;
         }
         if (store && runId)
@@ -300,7 +299,6 @@ calendarCommands
   .option('--output <file>', '照合・登録結果のJSON', 'reports/calendar-sync.json')
   .option('--database', 'PostgreSQLへ照合・登録結果を保存（既定で有効）', true)
   .option('--no-database', 'DBを使わずJSONのみ保存')
-  .option('--fail-on-hold', '重複の可能性による保留も終了コード2にする', false)
   .action(async (options) =>
     withTracking(options.database, async (store) => {
       const selection = await readSelection(options.report);
@@ -313,17 +311,13 @@ calendarCommands
           options.apply ? 'calendar:apply' : 'calendar:preview',
           target,
         );
-        const report = JSON.parse(await readFile(options.report, 'utf8'));
-        const sourceScope =
-          report.sourceScope ?? mailScope(mailAccount(), report.mailbox, report.uidValidity);
-        if (store) await store.requireSourceMails(sourceScope, selection.events);
+        if (store) await store.requireSourceMails(selection.events);
         const api = new GoogleCalendar(
           await createGoogleAuth(options.authFile),
           options.calendarId,
         );
         const result = await syncCalendarToFile(selection, api, {
           ...options,
-          resolution: store ? (event) => store.resolution(target, event.eventKey) : undefined,
           checkpoint:
             store && runId
               ? async (rows) => {
@@ -331,14 +325,7 @@ calendarCommands
                   const selected = selection.events.find((e) => e.eventKey === row.eventKey)!;
                   // Preview never overwrites the operational state or applies manual decisions to Google.
                   if (options.apply)
-                    await store.saveSync(
-                      runId!,
-                      target,
-                      options.calendarId,
-                      sourceScope,
-                      selected,
-                      row,
-                    );
+                    await store.saveSync(runId!, target, options.calendarId, selected, row);
                 }
               : undefined,
         });
@@ -350,21 +337,16 @@ calendarCommands
           calendarId: result.calendarId,
           calendarWrites: result.calendarWrites,
           pastSkipped: result.pastSkippedAtRead,
-          summary: counts,
+          summary: {
+            registered: counts.created ?? 0,
+            wouldRegister: counts.would_create ?? 0,
+            doNotRegister: result.rows.filter((r) => !r.shouldRegister).length,
+          },
           output: result.output,
         });
         if (store && runId)
-          await store.finishRun(
-            runId,
-            !result.complete
-              ? 'error'
-              : counts.possible_duplicate
-                ? 'needs_attention'
-                : 'completed',
-            counts,
-          );
-        if (!result.complete || (options.failOnHold && counts.possible_duplicate))
-          process.exitCode = 2;
+          await store.finishRun(runId, !result.complete ? 'error' : 'completed', counts);
+        if (!result.complete) process.exitCode = 2;
       } catch (error) {
         if (store && runId)
           await store.finishRun(runId, 'error', { message: 'カレンダー照合・登録失敗' });

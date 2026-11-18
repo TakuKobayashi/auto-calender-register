@@ -1,5 +1,5 @@
 {
-  "id": "7b58c5c7-5604-42e0-a3c9-c6c3bdc17ef5",
+  "id": "c902a923-9f0a-4ba0-9dc1-111c32a5a182",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -81,6 +81,12 @@
           "primaryKey": false,
           "notNull": true
         },
+        "should_register": {
+          "name": "should_register",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true
+        },
         "reason": {
           "name": "reason",
           "type": "text",
@@ -89,18 +95,6 @@
         },
         "google_event_id": {
           "name": "google_event_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "resolution": {
-          "name": "resolution",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "resolved_google_event_id": {
-          "name": "resolved_google_event_id",
           "type": "text",
           "primaryKey": false,
           "notNull": false
@@ -251,6 +245,77 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.mail_accounts": {
+      "name": "mail_accounts",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "bigint",
+          "primaryKey": true,
+          "notNull": true,
+          "identity": {
+            "type": "byDefault",
+            "name": "mail_accounts_id_seq",
+            "schema": "public",
+            "increment": "1",
+            "startWith": "1",
+            "minValue": "1",
+            "maxValue": "9223372036854775807",
+            "cache": "1",
+            "cycle": false
+          }
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "provider": {
+          "name": "provider",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "account_key": {
+          "name": "account_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "label": {
+          "name": "label",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "mail_accounts_provider_account_key_unique": {
+          "name": "mail_accounts_provider_account_key_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "provider",
+            "account_key"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.mailboxes": {
       "name": "mailboxes",
       "schema": "",
@@ -286,6 +351,12 @@
           "notNull": true,
           "default": "now()"
         },
+        "mail_account_id": {
+          "name": "mail_account_id",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
         "scope": {
           "name": "scope",
           "type": "text",
@@ -298,18 +369,23 @@
           "primaryKey": false,
           "notNull": true
         },
-        "uid_validity": {
-          "name": "uid_validity",
+        "provider_mailbox_id": {
+          "name": "provider_mailbox_id",
           "type": "text",
           "primaryKey": false,
           "notNull": true
         },
-        "last_observed_uid": {
-          "name": "last_observed_uid",
-          "type": "bigint",
+        "generation": {
+          "name": "generation",
+          "type": "text",
           "primaryKey": false,
-          "notNull": true,
-          "default": 0
+          "notNull": false
+        },
+        "checkpoint": {
+          "name": "checkpoint",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
         },
         "last_complete_scan_at": {
           "name": "last_complete_scan_at",
@@ -325,7 +401,21 @@
         }
       },
       "indexes": {},
-      "foreignKeys": {},
+      "foreignKeys": {
+        "mailboxes_mail_account_id_mail_accounts_id_fk": {
+          "name": "mailboxes_mail_account_id_mail_accounts_id_fk",
+          "tableFrom": "mailboxes",
+          "tableTo": "mail_accounts",
+          "columnsFrom": [
+            "mail_account_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {
         "mailboxes_scope_unique": {
@@ -381,11 +471,31 @@
           "primaryKey": false,
           "notNull": true
         },
-        "uid": {
-          "name": "uid",
-          "type": "bigint",
+        "provider_message_id": {
+          "name": "provider_message_id",
+          "type": "text",
           "primaryKey": false,
           "notNull": true
+        },
+        "internet_message_id": {
+          "name": "internet_message_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "from": {
+          "name": "from",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "''"
+        },
+        "subject": {
+          "name": "subject",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "''"
         },
         "received_at": {
           "name": "received_at",
@@ -412,7 +522,23 @@
           "notNull": false
         }
       },
-      "indexes": {},
+      "indexes": {
+        "mails_internet_message_id_index": {
+          "name": "mails_internet_message_id_index",
+          "columns": [
+            {
+              "expression": "internet_message_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
       "foreignKeys": {
         "mails_mailbox_id_mailboxes_id_fk": {
           "name": "mails_mailbox_id_mailboxes_id_fk",
@@ -430,12 +556,12 @@
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {
-        "mails_mailbox_id_uid_unique": {
-          "name": "mails_mailbox_id_uid_unique",
+        "mails_mailbox_id_provider_message_id_unique": {
+          "name": "mails_mailbox_id_provider_message_id_unique",
           "nullsNotDistinct": false,
           "columns": [
             "mailbox_id",
-            "uid"
+            "provider_message_id"
           ]
         }
       },

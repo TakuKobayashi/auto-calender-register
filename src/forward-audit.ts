@@ -2,7 +2,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { classifyMail, finalize } from './classify.js';
 import { listSinceMail, mailboxInfo, parseMail, withMailbox } from './mail.js';
-import type { CollectedMail, Collection } from './collect.js';
+import type { Collection } from './collect.js';
+import type { CollectedMail } from './domain/mail.js';
 import {
   extractWithOllama,
   extractionCacheKey,
@@ -13,6 +14,7 @@ import {
   type Extraction,
 } from './ollama.js';
 import { reconcileModelPlan } from './dry-run.js';
+import { mailLabel } from './domain/mail.js';
 
 export type ForwardCache = {
   since: string;
@@ -163,7 +165,7 @@ export async function auditForwards(
       (!options.sampleUids || options.sampleUids.includes(forwarded.uid))
     ) {
       modelCalls++;
-      console.error(`Ollama検証 ${modelCalls}: Sent UID ${forwarded.uid} (${options.model})`);
+      console.error(`メール判定 ${modelCalls}: ${mailLabel(forwarded)} (${options.model})`);
       const begin = Date.now();
       try {
         const key = extractionCacheKey(

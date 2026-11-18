@@ -2,6 +2,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import type { OAuth2Client } from 'google-auth-library';
 import { DateTime } from 'luxon';
+import { mailLabel } from './domain/mail.js';
 import {
   googleEventId,
   type SelectedEvent,
@@ -9,16 +10,10 @@ import {
   type CalendarPayload,
 } from './selection.js';
 
-export type GoogleEvent = {
-  id?: string;
-  status?: string;
-  summary?: string;
-  location?: string;
-  iCalUID?: string;
-  start?: { dateTime?: string; date?: string };
-  end?: { dateTime?: string; date?: string };
-  extendedProperties?: { private?: Record<string, string> };
-};
+import type { ExistingCalendarEvent } from './domain/calendar.js';
+import { matchExisting, type Match } from './event-matching.js';
+export { matchExisting } from './event-matching.js';
+export type GoogleEvent = ExistingCalendarEvent;
 export type ListQuery = {
   privateExtendedProperty?: string;
   iCalUID?: string;
@@ -106,57 +101,16 @@ export class GoogleCalendar implements CalendarPort {
     return results;
   }
   async insert(event: CalendarPayload & { id: string }) {
-    return this.request<GoogleEvent>('POST', this.url, { sendUpdates: 'none' }, event);
+    const { allDayDate, ...payload } = event;
+    const data = allDayDate
+      ? {
+          ...payload,
+          start: { date: allDayDate },
+          end: { date: DateTime.fromISO(allDayDate).plus({ days: 1 }).toISODate()! },
+        }
+      : payload;
+    return this.request<GoogleEvent>('POST', this.url, { sendUpdates: 'none' }, data);
   }
-}
-
-export type Match = {
-  kind: 'duplicate' | 'possible_duplicate' | 'previously_deleted';
-  event: GoogleEvent;
-};
-function normalizeTitle(value: string) {
-  return value
-    .normalize('NFKC')
-    .toLowerCase()
-    .replace(/\(\d+分\)/g, '')
-    .replace(/[\s\p{P}\p{S}]/gu, '');
-}
-
-export function matchExisting(selected: SelectedEvent, existing: GoogleEvent[]): Match | null {
-  const start = Date.parse(selected.payload.start.dateTime);
-  const title = normalizeTitle(selected.payload.summary);
-  const location = selected.payload.location.normalize('NFKC').replace(/\s/g, '');
-  let possible: GoogleEvent | undefined;
-  for (const event of existing) {
-    const identity =
-      event.id === googleEventId(selected.eventKey) ||
-      event.extendedProperties?.private?.sourceEventKey === selected.eventKey ||
-      event.iCalUID === selected.iCalUID;
-    if (identity)
-      return { kind: event.status === 'cancelled' ? 'previously_deleted' : 'duplicate', event };
-    if (event.status === 'cancelled') continue;
-    const otherTitle = normalizeTitle(event.summary ?? '');
-    const otherStart = event.start?.dateTime ? Date.parse(event.start.dateTime) : NaN;
-    const sameTitle = title === otherTitle && title.length > 0;
-    const similarTitle =
-      title.length >= 4 &&
-      otherTitle.length >= 4 &&
-      (title.includes(otherTitle) || otherTitle.includes(title));
-    const sameLocation =
-      location.length > 0 && event.location?.normalize('NFKC').replace(/\s/g, '') === location;
-    if (otherStart === start && sameTitle) return { kind: 'duplicate', event };
-    // Grokbot・手動登録でタイトルや時刻が少し異なるものを勝手に追加しない。
-    if (
-      otherStart === start ||
-      (Math.abs(otherStart - start) <= 15 * 60_000 && (sameTitle || similarTitle || sameLocation))
-    )
-      possible = event;
-    const localDate = DateTime.fromISO(selected.payload.start.dateTime, {
-      setZone: true,
-    }).toISODate();
-    if (event.start?.date === localDate && (sameTitle || similarTitle)) possible = event;
-  }
-  return possible ? { kind: 'possible_duplicate', event: possible } : null;
 }
 
 async function findExisting(
@@ -173,6 +127,7 @@ async function findExisting(
       return {
         kind: own.status === 'cancelled' ? 'previously_deleted' : 'duplicate',
         event: own,
+        reason: 'Matching deterministic event identifier',
       } as Match;
     }
     throw new Error('予定IDが別の予定と衝突しています。登録を中止しました。');
@@ -191,6 +146,9 @@ async function findExisting(
 }
 
 export type SyncRow = {
+  shouldRegister: boolean;
+  sourceFrom?: string;
+  sourceSubject?: string;
   eventKey: string;
   sourceUid: number;
   action:
@@ -212,9 +170,6 @@ export async function syncCalendar(
     apply: boolean;
     now?: () => Date;
     checkpoint?: (rows: SyncRow[]) => Promise<void>;
-    resolution?: (
-      selected: SelectedEvent,
-    ) => Promise<{ resolution: string | null; resolvedGoogleEventId: string | null } | undefined>;
   },
 ) {
   const rows: SyncRow[] = [];
@@ -225,31 +180,32 @@ export async function syncCalendar(
       eventKey: selected.eventKey,
       sourceUid: selected.sourceUid,
       action: 'error',
+      shouldRegister: false,
+      sourceFrom: selected.sourceFrom,
+      sourceSubject: selected.sourceSubject,
     };
     try {
-      const resolution = await options.resolution?.(selected);
-      if (resolution?.resolution === 'skip') row.action = 'skipped';
-      else if (resolution?.resolution === 'duplicate') {
-        const linked = resolution.resolvedGoogleEventId
-          ? await port.get(resolution.resolvedGoogleEventId)
-          : null;
-        if (!linked || linked.status === 'cancelled') {
-          row.action = 'possible_duplicate';
-          row.reason = '手動照合先が存在しないか削除済みです。再確認してください。';
-        } else {
-          row.action = 'duplicate';
-          row.googleEventId = linked.id;
-        }
-      } else if (Date.parse(selected.payload.start.dateTime) <= clock().getTime())
+      if (
+        Date.parse(
+          selected.payload.allDayDate
+            ? selected.payload.end.dateTime
+            : selected.payload.start.dateTime,
+        ) <= clock().getTime()
+      )
         row.action = 'past';
       else {
         const match = await findExisting(port, selected, withinBatch);
         if (match) {
           row.action = match.kind;
           row.googleEventId = match.event.id;
-          if (match.kind === 'possible_duplicate')
-            row.reason = `既存予定「${match.event.summary ?? '(タイトルなし)'}」との日時・タイトル・場所の照合で重複の可能性があります。`;
-        } else if (Date.parse(selected.payload.start.dateTime) <= clock().getTime())
+          row.reason = match.reason;
+        } else if (
+          Date.parse(
+            selected.payload.allDayDate
+              ? selected.payload.end.dateTime
+              : selected.payload.start.dateTime,
+          ) <= clock().getTime()
+        )
           row.action = 'past';
         else if (!options.apply) {
           row.action = 'would_create';
@@ -284,6 +240,17 @@ export async function syncCalendar(
           ? error.message
           : '予定の照合または登録に失敗しました。登録結果を再確認して再実行してください。';
     }
+    row.shouldRegister = row.action === 'created' || row.action === 'would_create';
+    row.reason ??= row.shouldRegister
+      ? '未来の確定予定で、指定カレンダーに一致する既存予定なし'
+      : row.action === 'past'
+        ? '日時を過ぎているため登録しない'
+        : row.action === 'previously_deleted'
+          ? '以前削除された予定のため再登録しない'
+          : '既存予定と一致するため重複登録しない';
+    console.error(
+      `${row.shouldRegister ? '登録する' : '登録しない'}: ${mailLabel({ from: selected.sourceFrom ?? '', subject: selected.sourceSubject ?? selected.payload.summary, source: selected.source })} ｜ ${row.reason}`,
+    );
     rows.push(row);
     if (options.checkpoint) await options.checkpoint(rows);
   }
@@ -298,9 +265,6 @@ export async function syncCalendarToFile(
     calendarId: string;
     output: string;
     checkpoint?: (rows: SyncRow[]) => Promise<void>;
-    resolution?: (
-      selected: SelectedEvent,
-    ) => Promise<{ resolution: string | null; resolvedGoogleEventId: string | null } | undefined>;
   },
 ) {
   const target = resolve(options.output);
@@ -324,7 +288,6 @@ export async function syncCalendarToFile(
   await write([], false);
   const rows = await syncCalendar(selection, port, {
     apply: options.apply,
-    resolution: options.resolution,
     checkpoint: async (rows) => {
       await options.checkpoint?.(rows);
       await write(rows, false);

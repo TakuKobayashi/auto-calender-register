@@ -17,6 +17,7 @@ import {
 } from './ollama.js';
 import type { Store } from './db/store.js';
 import { finalize } from './classify.js';
+import { mailLabel, sourceScope } from './domain/mail.js';
 
 type ExistingEvent = {
   id?: string;
@@ -100,22 +101,11 @@ export async function writeDryRun(
 ) {
   const overrides = new Map<number, MailPlan>();
   if (model) {
-    // 全文を無差別にモデルへ流さず、ルールで拾った候補・要確認と予約らしい本文を再判定。
     const initial = classifyAll(collection.messages, now);
     for (let i = 0; i < collection.messages.length; i++) {
       const mail = collection.messages[i]!;
       const plan = initial[i]!;
-      if (
-        !['candidate', 'review', 'pending'].includes(plan.decision) &&
-        !/予約が成功|お客様のチケット|ご予約いただ|booking is confirmed|旅程|発券|フライト|check.?in|チェックイン/i.test(
-          modelText(mail).slice(0, 4000),
-        ) &&
-        !/打ち合わせ|打合せ|面談|面接|旅程|チケット|航空券|予約|受験|試験|appointment|meeting|itinerary|reservation|ticket|flight|booking/i.test(
-          mail.subject,
-        )
-      )
-        continue;
-      console.error(`Ollama再判定 UID ${mail.uid}`);
+      console.error(`メールを判定: ${mailLabel(mail)}`);
       let key: string | undefined;
       try {
         checkedModelText(mail);
@@ -147,7 +137,7 @@ export async function writeDryRun(
         const reason = ollamaFailureReason(error);
         if (decision === 'review' && key && store)
           await store.saveExtraction(key, model, { kind: 'review', reason });
-        console.error(`UID ${mail.uid}: ${reason}`);
+        console.error(`登録しない: ${mailLabel(mail)} ｜ ${reason}`);
         overrides.set(mail.uid, {
           ...plan,
           decision,
@@ -172,12 +162,18 @@ export async function writeDryRun(
       uid: error.uid,
       subject: error.subject,
       from: '',
+      source: error.source,
       receivedAt: null,
       messageId: null,
       decision: 'error',
       reasons: [error.reason],
       events: [],
     });
+  for (const plan of plans) {
+    plan.shouldRegister = plan.events.some((event) => event.decision === 'candidate');
+    if (!plan.shouldRegister && !plan.reasons.length && plan.events.length)
+      plan.reasons.push(...new Set(plan.events.flatMap((e) => e.reasons)));
+  }
   const counts = { candidate: 0, review: 0, excluded: 0, duplicate: 0, error: 0, pending: 0 };
   for (const plan of plans) counts[plan.decision]++;
   const proposed = plans.flatMap((p) =>
@@ -186,6 +182,8 @@ export async function writeDryRun(
       .map((e) => ({
         sourceUid: p.uid,
         sourceSubject: p.subject,
+        sourceFrom: p.from,
+        source: p.source,
         eventKey: e.eventKey,
         operation: existingFile
           ? 'would_insert_if_snapshot_is_current'
@@ -206,7 +204,13 @@ export async function writeDryRun(
     complete: collection.complete && counts.error === 0 && plans.length === collection.matched,
     calendarDuplicateCheck: existingFile ? 'local_snapshot_only' : 'not_connected',
     calendarWrites: 0,
-    summary: { scanned: plans.length, ...counts, proposedEvents: proposed.length },
+    summary: {
+      scanned: plans.length,
+      register: plans.filter((p) => p.shouldRegister).length,
+      skip: plans.filter((p) => !p.shouldRegister).length,
+      ...counts,
+      proposedEvents: proposed.length,
+    },
     proposed,
     messages: plans,
   };
@@ -219,101 +223,51 @@ export async function writeDryRun(
     '**Googleカレンダーへの書き込み: 0件**',
     `既存カレンダー照合: ${existingFile ? 'ローカルスナップショットのみ（最新性は未保証）' : '未接続・未確認。候補は登録確定ではありません。'}`,
     '',
-    `確認メール ${plans.length}件 / 候補 ${counts.candidate}件 / 要確認 ${counts.review}件 / 未確定 ${counts.pending}件 / 対象外 ${counts.excluded}件 / 重複 ${counts.duplicate}件 / エラー ${counts.error}件`,
+    `確認メール ${plans.length}件 / 登録候補 ${proposed.length}件 / 登録しない ${plans.filter((p) => !p.shouldRegister).length}件 / 処理エラー ${counts.error}件`,
     '',
     '## 登録候補',
     '',
-    '| 元メールUID | 予定 | 開始 | 終了 | タイムゾーン | 場所 | 判定根拠 |',
+    '| 送信元・件名 | 予定 | 開始 | 終了 | タイムゾーン | 場所 | 判定根拠 |',
     '|---|---|---|---|---|---|---|',
   ];
   const row = (p: MailPlan, e: EventPlan) =>
-    `| ${p.uid} | ${md(e.title)} | ${md(displayDate(e.start))} | ${md(displayDate(e.end))} | ${md(e.timeZone)} | ${md(e.location)} | ${md(e.reasons.join(' / '))} |`;
+    `| ${md(mailLabel(p))} | ${md(e.title)} | ${md(displayDate(e.start))} | ${md(displayDate(e.end))} | ${md(e.timeZone)} | ${md(e.location)} | ${md(e.reasons.join(' / '))} |`;
   for (const p of plans)
     for (const e of p.events.filter((e) => e.decision === 'candidate')) lines.push(row(p, e));
   if (!proposed.length) lines.push('| — | 登録候補なし | | | | | |');
-  const futureReviews = plans.flatMap((p) =>
-    p.events
-      .filter(
-        (e) =>
-          e.decision === 'review' &&
-          ((e.start && new Date(e.start) > now) ||
-            (!e.start &&
-              e.localStart &&
-              e.localStart.slice(0, 10) >
-                DateTime.fromJSDate(now).setZone('Asia/Tokyo').toISODate()!)),
-      )
-      .map((e) => ({ p, e })),
-  );
   lines.push(
     '',
-    '## 未来の日時が記載されている要確認予定',
+    '## 登録する／登録しないの判定',
     '',
-    '| 元メールUID | 件名・予定 | 開始 | 終了 | 判定理由 |',
-    '|---|---|---|---|---|',
+    '| 登録する | 送信元 | 件名 | 理由 |',
+    '|---|---|---|---|',
   );
-  for (const { p, e } of futureReviews)
+  for (const p of plans)
     lines.push(
-      `| ${p.uid} | ${md(e.title)} | ${md(displayStart(e))} | ${md(displayDate(e.end))} | ${md(e.reasons.join(' / '))} |`,
+      `| ${p.shouldRegister ? 'true' : 'false'} | ${md(p.from)} | ${md(p.subject)} | ${md([...p.reasons, ...p.events.flatMap((e) => e.reasons)].join(' / '))} |`,
     );
-  lines.push(
-    '',
-    '## 要確認',
-    '',
-    '| 元メールUID | 件名・予定 | 開始 | 終了 | 判定理由 |',
-    '|---|---|---|---|---|',
-  );
-  for (const p of plans.filter((p) => p.decision === 'review')) {
-    const events = p.events.filter((e) => e.decision === 'review');
-    if (!events.length)
-      lines.push(
-        `| ${p.uid} | ${md(p.subject)} | 未確定 | 未確定 | ${md(p.reasons.join(' / '))} |`,
-      );
-    for (const e of events)
-      lines.push(
-        `| ${p.uid} | ${md(e.title)} | ${md(displayStart(e))} | ${md(displayDate(e.end))} | ${md(e.reasons.join(' / '))} |`,
-      );
-  }
-  lines.push(
-    '',
-    '## 未確定・確定通知待ち',
-    '',
-    '| 元メールUID | 件名 | 判定理由 |',
-    '|---|---|---|',
-  );
-  for (const p of plans.filter((p) => p.decision === 'pending'))
-    lines.push(`| ${p.uid} | ${md(p.subject)} | ${md(p.reasons.join(' / '))} |`);
-  lines.push('', '## 処理エラー', '', '| 元メールUID | 件名 | 失敗理由 |', '|---|---|---|');
-  for (const p of plans.filter((p) => p.decision === 'error'))
-    lines.push(`| ${p.uid} | ${md(p.subject)} | ${md(p.reasons.join(' / '))} |`);
-  lines.push(
-    '',
-    '## 確認方法',
-    '',
-    'UIDを指定して元メールを表示できます。',
-    '',
-    '```sh',
-    'node --import tsx src/cli.ts show <UID>',
-    '```',
-    '',
-    '対象外・重複も含む全メールの判定、根拠の抜粋、登録用payloadは dry-run.json を参照してください。',
-    'JSONのcandidateは既存カレンダー照合前の候補です。要確認メールは自動登録しません。',
-    'このツールはルールベースです。未対応の文面は見落とす可能性があり、全予定の抽出を保証しません。',
-    '',
-  );
   await mkdir(directory, { recursive: true });
   await writeFile(resolve(directory, 'dry-run.json'), JSON.stringify(report, null, 2), {
     mode: 0o600,
   });
   await writeFile(resolve(directory, 'dry-run.md'), lines.join('\n'), { mode: 0o600 });
-  if (store && collection.sourceScope) await store.savePlans(collection.sourceScope, plans);
+  if (store) {
+    const scopes = new Set(plans.filter((p) => p.source).map((p) => sourceScope(p.source!)));
+    for (const scope of scopes)
+      await store.savePlans(
+        scope,
+        plans.filter((p) => p.source && sourceScope(p.source) === scope),
+      );
+  }
   return report;
 }
 
 export function reconcileModelPlan(rule: MailPlan, inferred: MailPlan): MailPlan {
   const merged = {
     ...inferred,
-    bookingIds: rule.bookingIds,
-    cancelled: rule.cancelled || inferred.intent === 'cancelled',
+    source: rule.source,
+    bookingIds: [...new Set([...(rule.bookingIds ?? []), ...(inferred.bookingIds ?? [])])],
+    cancelled: rule.cancelled || ['cancelled', 'completed'].includes(inferred.intent ?? ''),
   };
   if (rule.decision === 'pending' || inferred.decision === 'pending') {
     return {
@@ -335,8 +289,8 @@ export function reconcileModelPlan(rule: MailPlan, inferred: MailPlan): MailPlan
       ),
     )
   ) {
-    // CBTの明記された150分等をモデルが取りこぼしても、検証済みの終了時刻は捨てない。
     const retained = structuredClone(rule);
+    retained.bookingIds = merged.bookingIds;
     retained.intent = 'confirmed';
     retained.reasons.push(
       ...inferred.reasons,

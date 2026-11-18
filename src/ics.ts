@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import type { SelectedEvent, Selection } from './selection.js';
+import { DateTime } from 'luxon';
 
 export function escapeIcsText(text: string) {
   return text
@@ -47,8 +48,12 @@ export function createIcs(events: SelectedEvent[], now = new Date()) {
       'BEGIN:VEVENT',
       `UID:${escapeIcsText(event.iCalUID)}`,
       `DTSTAMP:${stamp(now)}`,
-      `DTSTART:${stamp(new Date(event.payload.start.dateTime))}`,
-      `DTEND:${stamp(new Date(event.payload.end.dateTime))}`,
+      event.payload.allDayDate
+        ? `DTSTART;VALUE=DATE:${event.payload.allDayDate.replaceAll('-', '')}`
+        : `DTSTART:${stamp(new Date(event.payload.start.dateTime))}`,
+      event.payload.allDayDate
+        ? `DTEND;VALUE=DATE:${DateTime.fromISO(event.payload.allDayDate).plus({ days: 1 }).toISODate()!.replaceAll('-', '')}`
+        : `DTEND:${stamp(new Date(event.payload.end.dateTime))}`,
       `SUMMARY:${escapeIcsText(event.payload.summary)}`,
       `LOCATION:${escapeIcsText(event.payload.location)}`,
       `DESCRIPTION:${escapeIcsText(event.payload.description)}`,

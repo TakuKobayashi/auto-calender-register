@@ -9,11 +9,12 @@ import type { CachedExtraction } from '../ollama.js';
 import type { SelectedEvent } from '../selection.js';
 import type { SyncRow } from '../google-calendar.js';
 import { databaseUrl } from './connection.js';
+import { sourceScope, type MailboxSource, type MailAccount } from '../domain/mail.js';
 
 export const hash = (value: unknown) =>
   createHash('sha256').update(JSON.stringify(value)).digest('hex');
-export function mailScope(account: string, mailbox: string, uidValidity: string) {
-  return hash({ account, mailbox, uidValidity });
+export function mailScope(account: MailAccount, mailbox: string, uidValidity: string) {
+  return sourceScope({ account, id: mailbox, name: mailbox, generation: uidValidity || undefined });
 }
 export function calendarTarget(account: string, calendarId: string) {
   return hash({ account, calendarId });
@@ -74,11 +75,31 @@ export class Store {
   }
   async ensureMailbox(
     scope: string,
-    collection: Pick<Collection, 'mailbox' | 'uidValidity' | 'since'>,
+    collection: Pick<Collection, 'mailbox' | 'uidValidity' | 'since'> & { source: MailboxSource },
   ) {
+    const account = collection.source.account;
+    const [storedAccount] = await this.db
+      .insert(tables.mailAccounts)
+      .values({
+        provider: account.provider,
+        accountKey: account.key,
+        label: account.label ?? account.key,
+      })
+      .onConflictDoUpdate({
+        target: [tables.mailAccounts.provider, tables.mailAccounts.accountKey],
+        set: { label: account.label ?? account.key },
+      })
+      .returning({ id: tables.mailAccounts.id });
     await this.db
       .insert(tables.mailboxes)
-      .values({ scope, ...collection, since: new Date(collection.since) })
+      .values({
+        scope,
+        mailAccountId: storedAccount!.id,
+        mailbox: collection.source.name,
+        providerMailboxId: collection.source.id,
+        generation: collection.source.generation,
+        since: new Date(collection.since),
+      })
       .onConflictDoUpdate({
         target: tables.mailboxes.scope,
         set: {
@@ -102,57 +123,78 @@ export class Store {
       throw new Error('メールボックスの記録がありません。先にメール取得・選別を実行してください。');
     return row.id;
   }
-  async requireSourceMails(scope: string, events: SelectedEvent[]) {
+  async requireSourceMails(events: SelectedEvent[]) {
     if (!events.length) return;
-    const mailboxId = await this.mailboxId(scope);
-    const uids = [...new Set(events.map((e) => e.sourceUid))];
-    const rows = await this.db
-      .select({ uid: tables.mails.uid })
-      .from(tables.mails)
-      .where(and(eq(tables.mails.mailboxId, mailboxId), inArray(tables.mails.uid, uids)));
-    if (rows.length !== uids.length)
-      throw new Error(
-        '元メールがDBにありません。先にDBを有効にしてメール取得・選別を実行してください。',
-      );
+    for (const event of events) {
+      if (!event.source)
+        throw new Error('元メールの取得元情報がありません。選別を再実行してください。');
+      const mailboxId = await this.mailboxId(sourceScope(event.source));
+      const rows = await this.db
+        .select({ id: tables.mails.id })
+        .from(tables.mails)
+        .where(
+          and(
+            eq(tables.mails.mailboxId, mailboxId),
+            eq(tables.mails.providerMessageId, event.source.messageId),
+          ),
+        );
+      if (!rows.length)
+        throw new Error('元メールがDBにありません。先にメール取得・選別を実行してください。');
+    }
   }
   async cachedMails(scope: string) {
     const mailboxId = await this.mailboxId(scope);
     return new Map(
       (await this.db.select().from(tables.mails).where(eq(tables.mails.mailboxId, mailboxId)))
         .filter((r) => r.data !== null)
-        .map((r) => [r.uid, r.data!]),
+        .map((r) => [r.providerMessageId, r.data!]),
     );
   }
   async saveMail(scope: string, mail: CollectedMail) {
+    if (!mail.source) throw new Error('元メールの取得元情報がありません。');
     const mailboxId = await this.mailboxId(scope);
     await this.db
       .insert(tables.mails)
       .values({
         mailboxId,
-        uid: mail.uid,
+        providerMessageId: mail.source.messageId,
+        internetMessageId: mail.messageId,
+        from: mail.from,
+        subject: mail.subject,
         data: mail,
         receivedAt: mail.receivedAt ? new Date(mail.receivedAt) : null,
       })
       .onConflictDoUpdate({
-        target: [tables.mails.mailboxId, tables.mails.uid],
-        set: { data: mail, fetchError: null, updatedAt: new Date() },
+        target: [tables.mails.mailboxId, tables.mails.providerMessageId],
+        set: {
+          data: mail,
+          internetMessageId: mail.messageId,
+          from: mail.from,
+          subject: mail.subject,
+          fetchError: null,
+          updatedAt: new Date(),
+        },
       });
   }
-  async fetchError(scope: string, uid: number, reason: string) {
+  async fetchError(scope: string, messageId: string, reason: string) {
     const mailboxId = await this.mailboxId(scope);
     await this.db
       .insert(tables.mails)
-      .values({ mailboxId, uid, fetchError: reason })
+      .values({ mailboxId, providerMessageId: messageId, fetchError: reason })
       .onConflictDoUpdate({
-        target: [tables.mails.mailboxId, tables.mails.uid],
+        target: [tables.mails.mailboxId, tables.mails.providerMessageId],
         set: { fetchError: reason, updatedAt: new Date() },
       });
   }
-  async completeScan(scope: string, lastObservedUid: number, complete: boolean) {
+  async completeScan(
+    scope: string,
+    checkpoint: { lastMessageId?: string; cursor?: string },
+    complete: boolean,
+  ) {
     await this.db
       .update(tables.mailboxes)
       .set({
-        lastObservedUid: sql`greatest(${tables.mailboxes.lastObservedUid}, ${lastObservedUid})`,
+        checkpoint,
         ...(complete ? { lastCompleteScanAt: new Date() } : {}),
         updatedAt: new Date(),
       })
@@ -164,7 +206,12 @@ export class Store {
       await this.db
         .update(tables.mails)
         .set({ plan, updatedAt: new Date() })
-        .where(and(eq(tables.mails.mailboxId, mailboxId), eq(tables.mails.uid, plan.uid)));
+        .where(
+          and(
+            eq(tables.mails.mailboxId, mailboxId),
+            eq(tables.mails.providerMessageId, plan.source!.messageId),
+          ),
+        );
   }
   async getExtraction(key: string) {
     return (
@@ -177,32 +224,24 @@ export class Store {
       .values({ key, model, data })
       .onConflictDoUpdate({ target: tables.extractions.key, set: { model, data } });
   }
-  async resolution(target: string, eventKey: string) {
-    return (
-      await this.db
-        .select()
-        .from(tables.calendarStates)
-        .where(
-          and(
-            eq(tables.calendarStates.target, target),
-            eq(tables.calendarStates.eventKey, eventKey),
-          ),
-        )
-    )[0];
-  }
   async saveSync(
     runId: number,
     target: string,
     calendarId: string,
-    sourceScope: string,
     selected: SelectedEvent,
     row: SyncRow,
   ) {
-    const mailboxId = await this.mailboxId(sourceScope);
+    if (!selected.source) throw new Error('元メールの取得元情報がありません。');
+    const mailboxId = await this.mailboxId(sourceScope(selected.source));
     const [sourceMail] = await this.db
       .select({ id: tables.mails.id })
       .from(tables.mails)
-      .where(and(eq(tables.mails.mailboxId, mailboxId), eq(tables.mails.uid, selected.sourceUid)));
+      .where(
+        and(
+          eq(tables.mails.mailboxId, mailboxId),
+          eq(tables.mails.providerMessageId, selected.source.messageId),
+        ),
+      );
     if (!sourceMail)
       throw new Error('元メールがDBにありません。先にメール取得・選別を実行してください。');
     await this.db.transaction(async (tx) => {
@@ -216,6 +255,7 @@ export class Store {
           title: selected.payload.summary,
           start: new Date(selected.payload.start.dateTime),
           action: row.action,
+          shouldRegister: row.shouldRegister,
           reason: row.reason,
           googleEventId: row.googleEventId,
           attempts: 1,
@@ -224,6 +264,7 @@ export class Store {
           target: [tables.calendarStates.target, tables.calendarStates.eventKey],
           set: {
             action: row.action,
+            shouldRegister: row.shouldRegister,
             sourceMailId: sourceMail.id,
             reason: row.reason ?? null,
             googleEventId: row.googleEventId ?? null,
@@ -241,28 +282,6 @@ export class Store {
         });
     });
   }
-  async resolve(
-    target: string,
-    eventKey: string,
-    decision: 'skip' | 'retry' | 'duplicate',
-    googleEventId?: string,
-  ) {
-    if (decision === 'duplicate' && !googleEventId)
-      throw new Error('duplicateには --google-event-id が必要です。');
-    const rows = await this.db
-      .update(tables.calendarStates)
-      .set({
-        resolution: decision === 'retry' ? null : decision,
-        resolvedGoogleEventId: decision === 'duplicate' ? googleEventId : null,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(eq(tables.calendarStates.target, target), eq(tables.calendarStates.eventKey, eventKey)),
-      )
-      .returning();
-    if (!rows.length) throw new Error('指定した予定の記録がありません。');
-    return rows[0];
-  }
   async status() {
     return {
       mailboxes: await this.db.select().from(tables.mailboxes),
@@ -277,27 +296,17 @@ export class Store {
       runs: await this.db.select().from(tables.runs).orderBy(desc(tables.runs.startedAt)).limit(20),
     };
   }
-  async holds() {
-    return this.db
-      .select()
-      .from(tables.calendarStates)
-      .where(
-        and(
-          inArray(tables.calendarStates.action, ['possible_duplicate', 'error']),
-          sql`${tables.calendarStates.start} > now()`,
-          sql`(${tables.calendarStates.resolution} is null or (${tables.calendarStates.resolution} = 'duplicate' and ${tables.calendarStates.action} = 'possible_duplicate'))`,
-        ),
-      );
-  }
-  async reviews() {
+  async decisions() {
     return this.db
       .select({
         id: tables.mails.id,
         mailboxId: tables.mails.mailboxId,
-        uid: tables.mails.uid,
+        providerMessageId: tables.mails.providerMessageId,
+        from: tables.mails.from,
+        subject: tables.mails.subject,
         plan: tables.mails.plan,
       })
       .from(tables.mails)
-      .where(sql`${tables.mails.plan}->>'decision' in ('review', 'pending', 'error')`);
+      .orderBy(desc(tables.mails.receivedAt));
   }
 }

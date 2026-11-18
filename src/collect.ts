@@ -1,13 +1,14 @@
 import { mkdir, writeFile } from 'node:fs/promises';
-import type { ImapFlow } from 'imapflow';
-import { listSinceMail, mailboxInfo, parseMail, summary } from './mail.js';
+import {
+  sourceScope,
+  type CollectedMail,
+  type MailboxSource,
+  type MessageSource,
+} from './domain/mail.js';
 import type { Store } from './db/store.js';
+import type { MailboxReader } from './sources/port.js';
+export type { CollectedMail } from './domain/mail.js';
 
-export type CollectedMail = Omit<
-  ReturnType<typeof summary>,
-  keyof Awaited<ReturnType<typeof parseMail>>
-> &
-  Awaited<ReturnType<typeof parseMail>>;
 export type Collection = {
   version: 1;
   mailbox: string;
@@ -17,97 +18,99 @@ export type Collection = {
   matched: number;
   complete: boolean;
   messages: CollectedMail[];
-  errors: { uid: number; subject: string; reason: string }[];
+  errors: { uid: number; subject: string; reason: string; from?: string; source?: MessageSource }[];
   sourceScope?: string;
+  source?: MailboxSource;
 };
 
-export async function collect(
-  client: ImapFlow,
+export async function collectSource(
+  reader: MailboxReader,
   since: Date,
   directory: string,
   maxBytes: number,
-  persistence?: { store: Store; scope: string },
-) {
-  const info = mailboxInfo(client);
-  if (persistence) since = await persistence.store.scanSince(persistence.scope, since);
-  const index = await listSinceMail(client, since);
+  store?: Store,
+): Promise<Collection> {
+  const scope = sourceScope(reader.source);
+  if (store) since = await store.scanSince(scope, since);
+  const { messages: index, checkpoint } = await reader.list(since);
   const result: Collection = {
     version: 1,
-    mailbox: info.mailbox,
-    uidValidity: info.uidValidity,
+    mailbox: reader.source.name,
+    uidValidity: reader.source.generation ?? '',
     since: since.toISOString(),
     collectedAt: new Date().toISOString(),
     matched: index.length,
     complete: false,
     messages: [],
     errors: [],
+    sourceScope: scope,
+    source: reader.source,
   };
-  if (persistence) {
-    result.sourceScope = persistence.scope;
-    await persistence.store.ensureMailbox(persistence.scope, result);
-  }
-  const cached = persistence
-    ? await persistence.store.cachedMails(persistence.scope)
-    : new Map<number, CollectedMail>();
-  // Keep archived/deleted source mail available for unfinished calendar checks and later cancellation matching.
-  const indexed = new Set(index.map((m) => m.uid));
+  if (store) await store.ensureMailbox(scope, { ...result, source: reader.source });
+  const cached = store ? await store.cachedMails(scope) : new Map<string, CollectedMail>();
+  const indexed = new Set(index.map((m) => m.source.messageId));
   const retained = [...cached.values()].filter(
-    (m) => !indexed.has(m.uid) && m.receivedAt && Date.parse(m.receivedAt) >= since.getTime(),
+    (m) =>
+      !indexed.has(m.source!.messageId) &&
+      m.receivedAt &&
+      Date.parse(m.receivedAt) >= since.getTime(),
   );
   result.messages.push(...retained);
   result.matched += retained.length;
   await mkdir(directory, { recursive: true });
   const save = () =>
     writeFile(`${directory}/mail-cache.json`, JSON.stringify(result, null, 2), { mode: 0o600 });
-  console.error(`対象メール: ${index.length}件。本文を読み取り専用で取得します。`);
+  await save();
+  console.error(
+    `対象メール: ${index.length}件（${reader.source.name}）。取得済み本文を再利用します。`,
+  );
   for (let i = 0; i < index.length; i += 5) {
     const batch = index.slice(i, i + 5);
-    for (const m of batch) {
-      const saved = cached.get(m.uid);
-      if (saved) result.messages.push({ ...m, ...saved, flags: m.flags, size: m.size });
+    for (const header of batch) {
+      const previous = cached.get(header.source.messageId);
+      if (previous)
+        result.messages.push({
+          ...previous,
+          uid: header.uid,
+          source: header.source,
+          flags: header.flags,
+          size: header.size,
+        });
     }
-    const missing = batch.filter((m) => !cached.has(m.uid));
+    const missing = batch.filter((m) => !cached.has(m.source.messageId));
     const allowed = missing.filter((m) => m.size !== undefined && m.size <= maxBytes);
-    for (const m of missing.filter((m) => !allowed.includes(m))) {
-      result.errors.push({
-        uid: m.uid,
-        subject: m.subject,
-        reason: 'サイズ不明または取得上限超過',
-      });
-    }
-    if (allowed.length) {
-      const fetched = await client.fetchAll(
-        allowed.map((m) => m.uid),
-        { uid: true, source: true },
-        { uid: true },
-      );
-      for (const m of allowed) {
-        const source = fetched.find((f) => f.uid === m.uid)?.source;
-        try {
-          if (!source || source.length > maxBytes) throw new Error('本文なし、または取得上限超過');
-          const parsed = { ...m, ...(await parseMail(source)) };
-          if (persistence) await persistence.store.saveMail(persistence.scope, parsed);
-          result.messages.push(parsed);
-        } catch {
-          result.errors.push({ uid: m.uid, subject: m.subject, reason: '本文の取得・解析失敗' });
-        }
+    const values = allowed.length
+      ? await reader.readBatch(allowed, maxBytes)
+      : new Map<string, CollectedMail | Error>();
+    for (const header of missing) {
+      const value = values.get(header.source.messageId);
+      if (value && !(value instanceof Error)) {
+        // Storage failures are operational failures, not mail parsing results.
+        if (store) await store.saveMail(scope, value);
+        result.messages.push(value);
+      } else {
+        const reason = !allowed.includes(header)
+          ? 'サイズ不明または取得上限超過'
+          : '本文の取得・解析失敗';
+        result.errors.push({
+          uid: header.uid,
+          from: header.from,
+          subject: header.subject,
+          source: header.source,
+          reason,
+        });
+        if (store) await store.fetchError(scope, header.source.messageId, reason);
       }
     }
     if ((i + 5) % 25 === 0 || i + 5 >= index.length) {
       await save();
-      console.error(`取得: ${Math.min(i + 5, index.length)}/${index.length}件`);
+      console.error(
+        `取得: ${Math.min(i + 5, index.length)}/${index.length}件（${reader.source.name}）`,
+      );
     }
   }
   result.complete = result.errors.length === 0;
-  if (persistence) {
-    for (const error of result.errors)
-      await persistence.store.fetchError(persistence.scope, error.uid, error.reason);
-    await persistence.store.completeScan(
-      persistence.scope,
-      Math.max(0, ...index.map((m) => m.uid)),
-      result.complete,
-    );
-  }
+  if (store) await store.completeScan(scope, checkpoint, result.complete);
   await save();
   return result;
 }

@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { DateTime } from 'luxon';
 import { isDeepStrictEqual } from 'node:util';
 import type { EventPlan } from './classify.js';
+import type { MessageSource } from './domain/mail.js';
 
 export type CalendarPayload = NonNullable<EventPlan['payload']>;
 export type SelectedEvent = {
@@ -10,6 +11,9 @@ export type SelectedEvent = {
   eventKey: string;
   iCalUID: string;
   payload: CalendarPayload;
+  source?: MessageSource;
+  sourceFrom?: string;
+  sourceSubject?: string;
 };
 export type Selection = {
   executedAt: string;
@@ -92,7 +96,17 @@ export function validateSelection(raw: unknown, now = new Date()): Selection {
     const start = parseDate(payload.start?.dateTime),
       end = parseDate(payload.end?.dateTime);
     if (end <= start) throw new Error('終了日時が開始日時以前です。');
-    if (start.toMillis() <= now.getTime()) {
+    if (payload.allDayDate) {
+      const day = DateTime.fromISO(payload.allDayDate, { zone: payload.start.timeZone ?? 'UTC' });
+      if (
+        !/^\d{4}-\d{2}-\d{2}$/.test(payload.allDayDate) ||
+        !day.isValid ||
+        day.toMillis() !== start.toMillis() ||
+        day.plus({ days: 1 }).toMillis() !== end.toMillis()
+      )
+        throw new Error('終日予定の日付と開始・終了が一致しません。');
+    }
+    if ((payload.allDayDate ? end.toMillis() : start.toMillis()) <= now.getTime()) {
       pastSkipped++;
       continue;
     }
@@ -111,7 +125,11 @@ export function validateSelection(raw: unknown, now = new Date()): Selection {
       sourceUid: proposal.sourceUid,
       eventKey: proposal.eventKey,
       iCalUID: originalUID || `${proposal.eventKey}@auto-calendar-register.local`,
+      source: mail.source,
+      sourceFrom: mail.from,
+      sourceSubject: mail.subject,
       payload: {
+        ...(payload.allDayDate ? { allDayDate: payload.allDayDate } : {}),
         summary: payload.summary,
         location: payload.location,
         description: payload.description,

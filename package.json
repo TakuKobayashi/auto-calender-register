@@ -34,14 +34,13 @@
     "db:migrate": "tsx src/db/cli.ts migrate",
     "db:studio": "drizzle-kit studio",
     "db:status": "tsx src/db/cli.ts status",
-    "db:holds": "tsx src/db/cli.ts holds",
-    "db:reviews": "tsx src/db/cli.ts reviews",
-    "db:resolve": "tsx src/db/cli.ts resolve",
     "db:dump": "tsx src/db/cli.ts dump",
     "db:restore": "tsx src/db/cli.ts restore",
-    "test:db": "tsx --test test/db.integration.ts"
+    "test:db": "tsx --test test/db.integration.ts",
+    "db:decisions": "tsx src/db/cli.ts decisions"
   },
   "dependencies": {
+    "@vvo/tzdb": "^6.204.0",
     "chrono-node": "^2.10.3",
     "commander": "^15.1.0",
     "dotenv": "^18.0.10",

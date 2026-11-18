@@ -6,6 +6,7 @@ import { hash } from './store.js';
 
 // Parent tables precede children for restore. Drizzle's own migration journal is managed by migrate.
 export const dumpTables = [
+  'mail_accounts',
   'mailboxes',
   'mails',
   'extractions',

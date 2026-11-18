@@ -10,7 +10,9 @@ import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import type { ImapFlow } from 'imapflow';
 import { Store, mailScope, hash } from '../src/db/store.js';
 import { dumpDatabase, restoreDatabase, dumpTables } from '../src/db/dump.js';
-import { collect, type Collection, type CollectedMail } from '../src/collect.js';
+import type { Collection, CollectedMail } from '../src/collect.js';
+import { collectSource } from '../src/collect.js';
+import { collectImapMailbox as collect } from '../src/sources/yahoo.js';
 import { extractionCacheKey, type Extraction } from '../src/ollama.js';
 import { writeDryRun } from '../src/dry-run.js';
 import { syncCalendar, type CalendarPort } from '../src/google-calendar.js';
@@ -51,22 +53,25 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
           .query(`select count(*)::int as count from information_schema.referential_constraints rc
         join information_schema.key_column_usage kcu on kcu.constraint_schema = rc.unique_constraint_schema and kcu.constraint_name = rc.unique_constraint_name
         where rc.constraint_schema = 'public' and kcu.column_name = 'id'`);
-        assert.equal(references.rows[0].count, 4);
+        assert.equal(references.rows[0].count, 5);
       },
     );
-    const scope = mailScope('test-user', 'INBOX', '1');
+    const account = { provider: 'yahoo-japan', key: 'test-user' };
+    const source = { account, id: 'INBOX', name: 'INBOX', generation: '1' };
+    const scope = mailScope(account, 'INBOX', '1');
     const since = new Date('2026-10-01T00:00:00Z');
     await store.ensureMailbox(scope, {
       mailbox: 'INBOX',
+      source,
       uidValidity: '1',
       since: since.toISOString(),
     });
     await t.test(
       'different accounts, folders and UIDVALIDITY never reuse the same UID identity',
       () => {
-        assert.notEqual(scope, mailScope('other', 'INBOX', '1'));
-        assert.notEqual(scope, mailScope('test-user', 'Sent', '1'));
-        assert.notEqual(scope, mailScope('test-user', 'INBOX', '2'));
+        assert.notEqual(scope, mailScope({ ...account, key: 'other' }, 'INBOX', '1'));
+        assert.notEqual(scope, mailScope(account, 'Sent', '1'));
+        assert.notEqual(scope, mailScope(account, 'INBOX', '2'));
       },
     );
     await t.test('a failed low UID is retried even after a higher UID was saved', async () => {
@@ -96,14 +101,15 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
           }));
         },
       } as unknown as ImapFlow;
-      const first = await collect(client, since, directory, 10000, { store, scope });
+      const first = await collect(client, since, directory, 10000, { store, scope, account });
       assert.equal(first.complete, false);
       assert.equal(first.errors[0]?.uid, 1);
-      assert.equal((await store.status()).mailboxes[0]?.lastObservedUid, 2);
+      assert.equal((await store.status()).mailboxes[0]?.checkpoint?.lastMessageId, '2');
       fail = false;
       const second = await collect(client, new Date('2026-11-01T00:00:00Z'), directory, 10000, {
         store,
         scope,
+        account,
       });
       assert.equal(second.complete, true);
       assert.deepEqual(second.messages.map((m) => m.uid).sort(), [1, 2]);
@@ -113,7 +119,7 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
       assert.equal((await store.status()).mailCounts[0]?.errors, 0);
     });
     const mail: CollectedMail = {
-      ...(await store.cachedMails(scope)).get(1)!,
+      ...(await store.cachedMails(scope)).get('1')!,
       subject: '予約',
       text: "引用符 ' と \\ と改行\n日本語 $$; COMMIT; --",
       receivedAt: '2026-11-01T00:00:00Z',
@@ -253,6 +259,9 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
     const eventKey = 'a'.repeat(64);
     const selected: SelectedEvent = {
       sourceUid: 1,
+      source: mail.source,
+      sourceFrom: mail.from,
+      sourceSubject: mail.subject,
       eventKey,
       iCalUID: 'test@local',
       payload: {
@@ -266,25 +275,22 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
     };
     const target = 'test-target';
     const run = await store.startRun('calendar:apply', target);
-    await store.saveSync(run, target, 'primary', scope, selected, {
+    await store.saveSync(run, target, 'primary', selected, {
       eventKey,
       sourceUid: 1,
       action: 'possible_duplicate',
+      shouldRegister: false,
       googleEventId: 'existing',
     });
-    await store.finishRun(run, 'needs_attention', { possible_duplicate: 1 });
+    await store.finishRun(run, 'completed', { doNotRegister: 1 });
     await t.test(
-      'holds are saved and rechecked, while manual skip/duplicate decisions persist',
+      'calendar duplicate decisions are binary and never insert an uncertain match',
       async () => {
-        assert.equal((await store.holds()).length, 1);
         let inserts = 0;
         const port: CalendarPort = {
-          get: async (id) =>
-            id === 'existing'
-              ? { id, summary: 'different name', start: selected.payload.start }
-              : null,
+          get: async () => null,
           list: async () => [
-            { id: 'existing', summary: 'different name', start: selected.payload.start },
+            { id: 'existing', summary: 'different title', start: selected.payload.start },
           ],
           insert: async (payload) => {
             inserts++;
@@ -297,35 +303,61 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
           pastSkipped: 0,
           repeatedSkipped: 0,
         };
-        const options = {
-          apply: true,
-          resolution: (e: SelectedEvent) => store.resolution(target, e.eventKey),
+        const row = (await syncCalendar(selection, port, { apply: true }))[0]!;
+        assert.equal(row.shouldRegister, false);
+        assert.equal(inserts, 0);
+        await store.saveSync(run, target, 'primary', selected, row);
+      },
+    );
+    await t.test(
+      'Gmail native ids remain strings and are isolated by service and account',
+      async () => {
+        const gmail = {
+          account: { provider: 'gmail', key: 'user@example.com' },
+          id: 'INBOX',
+          name: 'Inbox',
         };
-        assert.equal(
-          (await syncCalendar(selection, port, options))[0]?.action,
-          'possible_duplicate',
+        const gmailScope = mailScope(gmail.account, gmail.id, '');
+        await store.ensureMailbox(gmailScope, {
+          mailbox: gmail.name,
+          source: gmail,
+          uidValidity: '',
+          since: since.toISOString(),
+        });
+        const nativeId = '18d7abcdef123456';
+        const gmailMessage = {
+          ...mail,
+          uid: 1,
+          source: { ...gmail, messageId: nativeId },
+        };
+        await collectSource(
+          {
+            source: gmail,
+            list: async () => ({
+              messages: [gmailMessage],
+              checkpoint: { lastMessageId: nativeId, cursor: '98765432109876543210' },
+            }),
+            readBatch: async () => new Map([[nativeId, gmailMessage]]),
+          },
+          since,
+          directory,
+          10485760,
+          store,
         );
-        await store.resolve(target, eventKey, 'skip');
-        assert.equal((await syncCalendar(selection, port, options))[0]?.action, 'skipped');
-        assert.equal((await store.holds()).length, 0);
-        await store.resolve(target, eventKey, 'duplicate', 'existing');
-        assert.equal((await syncCalendar(selection, port, options))[0]?.action, 'duplicate');
-        const originalGet = port.get;
-        port.get = async () => null;
-        const missingLink = (await syncCalendar(selection, port, options))[0]!;
-        assert.equal(missingLink.action, 'possible_duplicate');
-        await store.saveSync(run, target, 'primary', scope, selected, missingLink);
-        assert.equal((await store.holds()).length, 1);
-        port.get = originalGet;
-        await store.resolve(target, eventKey, 'retry');
-        assert.equal(
-          (await syncCalendar(selection, port, options))[0]?.action,
-          'possible_duplicate',
+        assert.equal((await store.cachedMails(gmailScope)).get(nativeId)?.subject, mail.subject);
+        const row = await store.pool.query(
+          'select provider_message_id from mails where provider_message_id = $1',
+          [nativeId],
         );
-        port.list = async () => [];
-        assert.equal((await syncCalendar(selection, port, options))[0]?.action, 'created');
-        assert.equal(inserts, 1);
-        assert.ok(googleEventId(eventKey));
+        assert.equal(row.rows[0].provider_message_id, nativeId);
+        assert.equal(
+          (await store.status()).mailboxes.find((m) => m.scope === gmailScope)?.checkpoint?.cursor,
+          '98765432109876543210',
+        );
+        assert.notEqual(
+          gmailScope,
+          mailScope({ ...gmail.account, provider: 'yahoo-japan' }, gmail.id, ''),
+        );
       },
     );
     await t.test(
@@ -333,14 +365,18 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
       async () => {
         const dumped = await dumpDatabase(store, join(directory, 'dump'));
         const sql = await readFile(join(dumped.directory, 'mails', 'data.sql'), 'utf8');
-        assert.equal((sql.match(/INSERT INTO/g) ?? []).length, 2);
-        assert.equal(sql.split('\n').filter((line) => line.startsWith('INSERT INTO')).length, 2);
+        assert.equal((sql.match(/INSERT INTO/g) ?? []).length, 3);
+        assert.equal(sql.split('\n').filter((line) => line.startsWith('INSERT INTO')).length, 3);
         assert.match(sql, /ALTER SEQUENCE .* RESTART WITH \d+;/);
         assert.doesNotMatch(sql, /COPY /);
         await assert.rejects(restoreDatabase(store, join(directory, 'dump')), /データが存在/);
         await restoreDatabase(store, join(directory, 'dump'), true);
-        assert.deepEqual((await store.cachedMails(scope)).get(1), mail);
-        assert.equal((await store.holds()).length, 1);
+        assert.deepEqual((await store.cachedMails(scope)).get('1'), mail);
+        assert.equal(
+          (await store.pool.query('select should_register from calendar_states')).rows[0]
+            .should_register,
+          false,
+        );
         // A valid manifest with invalid SQL must roll back the earlier truncation and INSERTs too.
         const manifestPath = join(dumped.directory, 'manifest.json');
         const manifestText = await readFile(manifestPath, 'utf8');
@@ -352,7 +388,7 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
           hash('INVALID SQL;');
         await writeFile(manifestPath, JSON.stringify(manifest));
         await assert.rejects(restoreDatabase(store, dumped.directory, true));
-        assert.deepEqual((await store.cachedMails(scope)).get(1), mail);
+        assert.deepEqual((await store.cachedMails(scope)).get('1'), mail);
         await writeFile(attemptsPath, attemptsSql);
         await writeFile(manifestPath, manifestText);
         // Exercise the default non-replacing import into an empty, migrated test database.
@@ -360,7 +396,7 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
           `TRUNCATE ${dumpTables.map((name) => `"public"."${name}"`).join(', ')}`,
         );
         await restoreDatabase(store, join(directory, 'dump'));
-        assert.deepEqual((await store.cachedMails(scope)).get(1), mail);
+        assert.deepEqual((await store.cachedMails(scope)).get('1'), mail);
         // Explicit ids restored from SQL must not collide with the next automatic id in any table.
         const maxima = new Map<string, bigint>();
         for (const table of dumpTables) {
@@ -371,10 +407,15 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
         }
         await store.ensureMailbox('new-scope', {
           mailbox: 'Sent',
+          source: { account: { provider: 'gmail', key: 'test-gmail' }, id: 'SENT', name: 'Sent' },
           uidValidity: '1',
           since: since.toISOString(),
         });
-        await store.saveMail(scope, { ...mail, uid: 100 });
+        await store.saveMail(scope, {
+          ...mail,
+          uid: 100,
+          source: { ...mail.source!, messageId: '100' },
+        });
         await store.saveExtraction('new-key', 'test-model', {
           intent: 'not_event',
           reason: '',
@@ -386,9 +427,13 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
           nextRun,
           target,
           'primary',
-          scope,
-          { ...selected, sourceUid: 100, eventKey: 'b'.repeat(64) },
-          { eventKey: 'b'.repeat(64), sourceUid: 100, action: 'created' },
+          {
+            ...selected,
+            sourceUid: 100,
+            source: { ...mail.source!, messageId: '100' },
+            eventKey: 'b'.repeat(64),
+          },
+          { eventKey: 'b'.repeat(64), sourceUid: 100, action: 'created', shouldRegister: true },
         );
         for (const table of dumpTables) {
           const result = await store.pool.query(`select max(id)::text as max from "${table}"`);
@@ -400,7 +445,7 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
         const path = join(dumped.directory, 'mails', 'data.sql');
         await writeFile(path, sql + '-- damaged');
         await assert.rejects(restoreDatabase(store, dumped.directory, true), /チェックサム/);
-        assert.deepEqual((await store.cachedMails(scope)).get(1), mail);
+        assert.deepEqual((await store.cachedMails(scope)).get('1'), mail);
       },
     );
   } finally {

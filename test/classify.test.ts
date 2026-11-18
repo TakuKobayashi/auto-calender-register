@@ -80,7 +80,7 @@ test('国内住所も明示タイムゾーンもなければ日本語でも要�
   assert.equal(result.events[0]?.start, null);
 });
 
-test('年・終了時刻の欠落を推測で補わない', () => {
+test('年の欠落は補わず、終了未記載の確定予定は開始通知として扱う', () => {
   const missingYear = classifyMail(mail({ text: '開催日時:11月30日 18:00～19:00 JST' }), now);
   assert.equal(missingYear.decision, 'review');
   const missingEnd = classifyMail(
@@ -88,7 +88,8 @@ test('年・終了時刻の欠落を推測で補わない', () => {
     now,
   );
   assert.equal(missingEnd.events[0]?.start, '2026-11-30T18:00:00.000+09:00');
-  assert.equal(missingEnd.decision, 'review');
+  assert.equal(missingEnd.decision, 'candidate');
+  assert.match(missingEnd.events[0]!.reasons.join(' '), /実際の所要時間ではありません/);
 });
 
 test('祝日の曜日表記があっても時刻範囲を解析', () => {

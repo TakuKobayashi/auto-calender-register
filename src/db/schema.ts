@@ -7,8 +7,9 @@ import {
   timestamp,
   unique,
   index,
+  boolean,
 } from 'drizzle-orm/pg-core';
-import type { CollectedMail } from '../collect.js';
+import type { CollectedMail } from '../domain/mail.js';
 import type { MailPlan } from '../classify.js';
 import type { CachedExtraction } from '../ollama.js';
 import type { SyncRow } from '../google-calendar.js';
@@ -22,12 +23,27 @@ const recordColumns = () => ({
     .$onUpdate(() => new Date()),
 });
 
+export const mailAccounts = pgTable(
+  'mail_accounts',
+  {
+    ...recordColumns(),
+    provider: text('provider').notNull(),
+    accountKey: text('account_key').notNull(),
+    label: text('label').notNull(),
+  },
+  (t) => [unique('mail_accounts_provider_account_key_unique').on(t.provider, t.accountKey)],
+);
+
 export const mailboxes = pgTable('mailboxes', {
   ...recordColumns(),
+  mailAccountId: bigint('mail_account_id', { mode: 'number' })
+    .notNull()
+    .references(() => mailAccounts.id),
   scope: text('scope').notNull().unique(),
   mailbox: text('mailbox').notNull(),
-  uidValidity: text('uid_validity').notNull(),
-  lastObservedUid: bigint('last_observed_uid', { mode: 'number' }).notNull().default(0),
+  providerMailboxId: text('provider_mailbox_id').notNull(),
+  generation: text('generation'),
+  checkpoint: jsonb('checkpoint').$type<{ lastMessageId?: string; cursor?: string }>(),
   lastCompleteScanAt: timestamp('last_complete_scan_at', { withTimezone: true }),
   since: timestamp('since', { withTimezone: true }).notNull(),
 });
@@ -39,13 +55,19 @@ export const mails = pgTable(
     mailboxId: bigint('mailbox_id', { mode: 'number' })
       .notNull()
       .references(() => mailboxes.id),
-    uid: bigint('uid', { mode: 'number' }).notNull(),
+    providerMessageId: text('provider_message_id').notNull(),
+    internetMessageId: text('internet_message_id'),
+    from: text('from').notNull().default(''),
+    subject: text('subject').notNull().default(''),
     receivedAt: timestamp('received_at', { withTimezone: true }),
     data: jsonb('data').$type<CollectedMail>(),
     fetchError: text('fetch_error'),
     plan: jsonb('plan').$type<MailPlan>(),
   },
-  (t) => [unique('mails_mailbox_id_uid_unique').on(t.mailboxId, t.uid)],
+  (t) => [
+    unique('mails_mailbox_id_provider_message_id_unique').on(t.mailboxId, t.providerMessageId),
+    index('mails_internet_message_id_index').on(t.internetMessageId),
+  ],
 );
 
 export const extractions = pgTable('extractions', {
@@ -82,10 +104,9 @@ export const calendarStates = pgTable(
     title: text('title').notNull(),
     start: timestamp('start', { withTimezone: true }).notNull(),
     action: text('action').notNull(),
+    shouldRegister: boolean('should_register').notNull(),
     reason: text('reason'),
     googleEventId: text('google_event_id'),
-    resolution: text('resolution'),
-    resolvedGoogleEventId: text('resolved_google_event_id'),
     attempts: integer('attempts').notNull().default(0),
   },
   (t) => [

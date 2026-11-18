@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Command, Option } from 'commander';
+import { Command } from 'commander';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { Store } from './store.js';
 import { dumpDatabase, restoreDatabase } from './dump.js';
@@ -33,37 +33,9 @@ program
   .description('確認済みUID・取得失敗数・直近の実行履歴')
   .action(() => withStore(async (s) => output(await s.status())));
 program
-  .command('holds')
-  .description('カレンダー照合の保留・登録失敗一覧')
-  .action(() => withStore(async (s) => output(await s.holds())));
-program
-  .command('reviews')
-  .description('メール判定の要確認・未確定・解析失敗一覧')
-  .action(() => withStore(async (s) => output(await s.reviews())));
-program
-  .command('resolve')
-  .description('保留に手動判断を記録（targetはdb:holdsの値）')
-  .requiredOption('--target <hash>', '照合対象の識別子')
-  .requiredOption('--event-key <key>', '予定の識別キー')
-  .addOption(
-    new Option(
-      '--decision <decision>',
-      'skip=登録不要、retry=判断を解除、duplicate=既存予定に紐付け',
-    )
-      .choices(['skip', 'retry', 'duplicate'])
-      .makeOptionMandatory(),
-  )
-  .option('--google-event-id <id>', '重複先のGoogle予定ID')
-  .action((o) =>
-    withStore(async (s) => {
-      const unlock = await s.lock(`calendar:${o.target}`);
-      try {
-        output(await s.resolve(o.target, o.eventKey, o.decision, o.googleEventId));
-      } finally {
-        await unlock();
-      }
-    }),
-  );
+  .command('decisions')
+  .description('Mail decisions with sender and subject')
+  .action(() => withStore(async (s) => output(await s.decisions())));
 program
   .command('dump')
   .description('テーブル別SQLへ出力（1レコード1 INSERT文）')

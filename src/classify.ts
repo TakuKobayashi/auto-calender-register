@@ -2,10 +2,13 @@ import { createHash } from 'node:crypto';
 import * as chrono from 'chrono-node';
 import { DateTime, FixedOffsetZone } from 'luxon';
 import * as ical from 'node-ical';
-import type { CollectedMail } from './collect.js';
+import type { CollectedMail } from './domain/mail.js';
+import { mailLabel, type MessageSource } from './domain/mail.js';
 
 export type Decision = 'candidate' | 'review' | 'excluded' | 'duplicate' | 'error' | 'pending';
 export type EventPlan = {
+  allDayDate?: string;
+  kind?: 'appointment' | 'deadline';
   title: string;
   start: string | null;
   end: string | null;
@@ -22,12 +25,15 @@ export type EventPlan = {
   intent?: import('./ollama.js').Intent;
   eventKey?: string;
   payload?: {
+    allDayDate?: string;
     summary: string;
     location: string;
     description: string;
     start: { dateTime: string; timeZone?: string };
     end: { dateTime: string; timeZone?: string };
-    extendedProperties: { private: { sourceEventKey: string } };
+    extendedProperties: {
+      private: { sourceEventKey: string; eventKind?: string; sourceReferenceKeys?: string };
+    };
   };
 };
 export type MailPlan = {
@@ -42,6 +48,8 @@ export type MailPlan = {
   bookingIds?: string[];
   cancelled?: boolean;
   intent?: import('./ollama.js').Intent;
+  source?: MessageSource;
+  shouldRegister?: boolean;
 };
 
 const confirmed =
@@ -133,18 +141,22 @@ export function finalize(plan: EventPlan, now: Date, mail: CollectedMail): Event
   if (plan.cancelled) {
     plan.decision = 'excluded';
     plan.reasons.push('キャンセル通知');
-  } else if (plan.start && new Date(plan.start).getTime() <= now.getTime()) {
+  } else if (
+    plan.start &&
+    new Date(plan.allDayDate ? plan.end! : plan.start).getTime() <= now.getTime()
+  ) {
     plan.decision = 'excluded';
-    plan.reasons.push('開始日時が実行時点以前');
+    plan.reasons.push(plan.allDayDate ? '期限が実行時点以前' : '開始日時が実行時点以前');
   }
   if (plan.decision === 'candidate' && plan.start && plan.end) {
     plan.eventKey = eventKey(plan);
     const zone =
       plan.timeZone && !plan.timeZone.startsWith('UTC') ? { timeZone: plan.timeZone } : {};
     plan.payload = {
+      ...(plan.allDayDate ? { allDayDate: plan.allDayDate } : {}),
       summary: plan.title,
       location: plan.location,
-      description: `メールから抽出した予定\n元メールUID: ${mail.uid}\nMessage-ID: ${mail.messageId ?? ''}\n根拠: ${plan.evidence}\n${plan.reasons.join('\n')}`,
+      description: `メールから抽出した予定\n送信元: ${mail.from}\n件名: ${mail.subject}\nMessage-ID: ${mail.messageId ?? ''}\n根拠: ${plan.evidence}\n${plan.reasons.join('\n')}`,
       start: { dateTime: plan.start, ...zone },
       end: {
         dateTime: plan.end,
@@ -233,7 +245,7 @@ function textEvents(mail: CollectedMail, now: Date): EventPlan[] {
   const text = activeText(mail.text);
   const subject = normalize(mail.subject);
   const reference = new Date(mail.date ?? mail.receivedAt ?? now.toISOString());
-  // 日付と時刻が別行のCBT予約等を同じ日時表現として解析する。
+  // 日付と時刻が別行の予約等を同じ日時表現として解析する。
   const prepared = text
     .replace(/(\d{4}年\d{1,2}月\d{1,2}日[^\n]*)\n\s*試験開始時刻\s*[:：]\s*/g, '$1 ')
     .replace(/(日)\s*\([^\n)]*(?:祝|振休)[^\n)]*\)/g, '$1 ');
@@ -323,6 +335,17 @@ function textEvents(mail: CollectedMail, now: Date): EventPlan[] {
       end = start.plus({ minutes: Number(duration) });
       reasons.push(`見出しの試験時間${duration}分から終了を算出`);
     }
+    if (
+      !end &&
+      resolvedZone &&
+      start.isValid &&
+      result.start.isCertain('year') &&
+      result.start.isCertain('hour') &&
+      confirmed.test(subject)
+    ) {
+      end = start.plus({ minutes: 15 });
+      reasons.push('終了時刻未記載。開始通知用の15分表示枠であり実際の所要時間ではありません');
+    }
     if (!end) {
       decision = 'review';
       reasons.push('終了日時・所要時間が未確定');
@@ -391,6 +414,7 @@ export function classifyMail(mail: CollectedMail, now: Date): MailPlan {
     events: [],
     bookingIds: bookingIds(mail),
     cancelled: cancellation.test(normalize(mail.subject)),
+    source: mail.source,
   };
   if (cancellation.test(normalize(mail.subject))) {
     result.reasons.push('件名が予約キャンセル通知。新規登録対象外');
@@ -468,6 +492,7 @@ export function classifyAll(
         from: mail.from,
         receivedAt: mail.receivedAt,
         messageId: mail.messageId,
+        source: mail.source,
         decision: 'error' as const,
         reasons: ['メールの予定解析に失敗'],
         events: [],
@@ -493,7 +518,7 @@ export function classifyAll(
     for (const older of group.slice(1)) {
       older.event.decision = 'duplicate';
       delete older.event.payload;
-      older.event.reasons.push(`同一予定の最新通知はUID ${group[0]!.plan.uid}`);
+      older.event.reasons.push(`同一予定の最新通知: ${mailLabel(group[0]!.plan)}`);
     }
   }
   // 同一事業者の予約番号に後続のキャンセル・変更があれば古い登録案を止める。
@@ -501,13 +526,18 @@ export function classifyAll(
     for (const event of plan.events) {
       if (event.decision !== 'candidate') continue;
       const newer = plans.filter(
-        (p) => p.uid > plan.uid && p.bookingIds?.some((id) => plan.bookingIds?.includes(id)),
+        (p) =>
+          (Date.parse(p.receivedAt ?? '') > Date.parse(plan.receivedAt ?? '') ||
+            (p.receivedAt === plan.receivedAt && p.uid > plan.uid)) &&
+          p.bookingIds?.some((id) => plan.bookingIds?.includes(id)),
       );
-      const latest = newer.sort((a, b) => b.uid - a.uid)[0];
+      const latest = newer.sort(
+        (a, b) => Date.parse(b.receivedAt ?? '') - Date.parse(a.receivedAt ?? '') || b.uid - a.uid,
+      )[0];
       if (!latest) continue;
       if (latest.cancelled) {
         event.decision = 'excluded';
-        event.reasons.push(`後続メールUID ${latest.uid} で同じ予約がキャンセル済み`);
+        event.reasons.push(`後続通知で取消・受取完了: ${mailLabel(latest)}`);
         delete event.payload;
       } else if (
         latest.events.some(
@@ -520,20 +550,22 @@ export function classifyAll(
       ) {
         // リマインダーに住所が省略されても、元の予約番号・科目・現地日時が一致すれば同じ予定。
         event.reasons.push(
-          `後続メールUID ${latest.uid} でも同じ予約番号・予定名・現地開始日時を確認`,
+          `後続通知でも同じ予約番号・予定名・現地開始日時を確認: ${mailLabel(latest)}`,
         );
         for (const other of latest.events.filter(
           (e) => e.title === event.title && e.localStart === event.localStart,
         )) {
           other.decision = 'duplicate';
           delete other.payload;
-          other.reasons.push(`詳細情報のあるUID ${plan.uid} と同じ予約の通知`);
+          other.reasons.push(`詳細情報のあるメールと同じ予約の通知: ${mailLabel(plan)}`);
         }
       } else if (
         !latest.events.some((e) => e.start === event.start && e.decision === 'candidate')
       ) {
         event.decision = 'review';
-        event.reasons.push(`同じ予約の後続メールUID ${latest.uid} の内容確認が必要`);
+        event.reasons.push(
+          `同じ予約の後続通知から確定できないため登録しない: ${mailLabel(latest)}`,
+        );
         delete event.payload;
       }
     }
