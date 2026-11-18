@@ -4,6 +4,37 @@ import type { CollectedMail } from './collect.js';
 import type { EventPlan, MailPlan } from './classify.js';
 import { createHash } from 'node:crypto';
 
+export class OllamaError extends Error {
+  constructor(
+    message: string,
+    readonly needsReview = false,
+  ) {
+    super(message);
+    this.name = 'OllamaError';
+  }
+}
+
+export function ollamaFailureReason(error: unknown) {
+  if (error instanceof OllamaError) return error.message;
+  if (error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name))
+    return 'Ollamaの応答が制限時間を超えました。次回実行で再試行します。';
+  if (error instanceof SyntaxError) return 'Ollamaの応答が有効なJSONではありません。';
+  if (error instanceof TypeError)
+    return 'ローカルOllamaへの接続に失敗しました。起動状態を確認してください。';
+  return 'Ollama判定または抽出キャッシュの処理に失敗しました。';
+}
+
+export function checkedModelText(mail: CollectedMail) {
+  const text = modelText(mail);
+  if (!text) throw new OllamaError('解析できる本文がないため要確認です。', true);
+  if (text.length > 24_000)
+    throw new OllamaError(
+      `本文がLLM入力上限を超えるため要確認です（${text.length}文字 / 上限24000文字）。`,
+      true,
+    );
+  return text;
+}
+
 // Include the actual prompt/schema and full input, so changes invalidate saved inference.
 export function extractionCacheKey(mail: CollectedMail, model: string, modelDigest: string) {
   const { flags: _flags, size: _size, ...input } = mail;
@@ -30,6 +61,12 @@ export type Extraction = {
     confirmationEvidence: string;
   }[];
 };
+
+export type ReviewOutcome = { kind: 'review'; reason: string };
+export type CachedExtraction = Extraction | ReviewOutcome;
+export function isReviewOutcome(value: CachedExtraction | undefined): value is ReviewOutcome {
+  return !!value && 'kind' in value && value.kind === 'review' && typeof value.reason === 'string';
+}
 
 const string = { type: 'string' };
 const nullable = { type: ['string', 'null'] };
@@ -85,7 +122,7 @@ export async function localModelDigest(model: string): Promise<string> {
   const tagsResponse = await fetch('http://127.0.0.1:11434/api/tags', {
     signal: AbortSignal.timeout(10_000),
   });
-  if (!tagsResponse.ok) throw new Error('ローカルモデル一覧を取得できません。');
+  if (!tagsResponse.ok) throw new OllamaError('ローカルモデル一覧を取得できません。');
   const tags = (await tagsResponse.json()) as {
     models?: { name: string; model: string; digest?: string }[];
   };
@@ -93,10 +130,12 @@ export async function localModelDigest(model: string): Promise<string> {
     (m) => [m.name, m.model].includes(model) || [m.name, m.model].includes(`${model}:latest`),
   );
   if (!installed) {
-    throw new Error('ダウンロード済みのローカルモデルだけを指定してください。');
+    throw new OllamaError('ダウンロード済みのローカルモデルだけを指定してください。');
   }
   if (!installed.digest || !/^(?:sha256:)?[a-f0-9]{64}$/i.test(installed.digest))
-    throw new Error('ローカルモデルのdigestを確認できません。古い抽出キャッシュは使用しません。');
+    throw new OllamaError(
+      'ローカルモデルのdigestを確認できません。古い抽出キャッシュは使用しません。',
+    );
   const response = await fetch('http://127.0.0.1:11434/api/show', {
     method: 'POST',
     body: JSON.stringify({ model }),
@@ -109,10 +148,10 @@ export async function localModelDigest(model: string): Promise<string> {
     thinking?: { values?: (string | boolean)[] };
   };
   if (!response.ok || info.remote_host || info.remote_model || info.details?.format !== 'gguf') {
-    throw new Error('クラウドモデルを使用せず、ローカルGGUFモデルを指定してください。');
+    throw new OllamaError('クラウドモデルを使用せず、ローカルGGUFモデルを指定してください。');
   }
   if (info.thinking?.values && !info.thinking.values.includes(false)) {
-    throw new Error('思考出力を無効にできないモデルはこの抽出処理の対象外です。');
+    throw new OllamaError('思考出力を無効にできないモデルはこの抽出処理の対象外です。');
   }
   checkedModels.set(model, installed.digest);
   return installed.digest;
@@ -164,7 +203,8 @@ startEvidence/endEvidence/zoneEvidence/confirmationEvidenceとevidenceには判�
 zoneEvidenceには「Europe/Prague」のようなあなたが算出したIANA名ではなく、原文にある「プラハ、チェコ共和国」のような実際の場所を引用してください。startLocal/endLocalには+09:00やZを付けないでください。`;
 
 export function validateExtraction(value: unknown): Extraction {
-  if (!value || typeof value !== 'object') throw new Error('LLM出力がオブジェクトではありません。');
+  if (!value || typeof value !== 'object')
+    throw new OllamaError('LLM出力がオブジェクトではありません。');
   const v = value as Extraction;
   if (
     !['confirmed', 'pending', 'cancelled', 'marketing', 'not_event', 'unclear'].includes(
@@ -175,9 +215,9 @@ export function validateExtraction(value: unknown): Extraction {
     !Array.isArray(v.events) ||
     v.events.length > 30
   )
-    throw new Error('LLM出力の形式不正');
+    throw new OllamaError('LLM出力の形式不正');
   for (const event of v.events) {
-    if (!event || typeof event !== 'object') throw new Error('予定形式不正');
+    if (!event || typeof event !== 'object') throw new OllamaError('予定形式不正');
     for (const key of [
       'title',
       'location',
@@ -186,11 +226,11 @@ export function validateExtraction(value: unknown): Extraction {
       'zoneEvidence',
       'confirmationEvidence',
     ] as const) {
-      if (typeof event[key] !== 'string') throw new Error('予定文字列の形式不正');
+      if (typeof event[key] !== 'string') throw new OllamaError('予定文字列の形式不正');
     }
     for (const key of ['startLocal', 'endLocal', 'startZone', 'endZone'] as const) {
       if (event[key] !== null && typeof event[key] !== 'string')
-        throw new Error('予定日時の形式不正');
+        throw new OllamaError('予定日時の形式不正');
     }
   }
   return v;
@@ -199,14 +239,12 @@ export function validateExtraction(value: unknown): Extraction {
 export async function extractWithOllama(
   mail: CollectedMail,
   model: string,
-  timeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS ?? 180_000),
+  timeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS ?? 600_000),
 ): Promise<Extraction> {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 1800_000)
-    throw new Error('OLLAMA_TIMEOUT_MSは1000〜1800000の整数で指定してください。');
+    throw new OllamaError('OLLAMA_TIMEOUT_MSは1000〜1800000の整数で指定してください。');
   // アカウント本文を外部ホストに送らないよう接続先はループバック固定。
-  const text = modelText(mail);
-  if (!text) throw new Error('本文を解析できません。広告と判断せず保留します。');
-  if (text.length > 24_000) throw new Error('本文がLLMの入力上限を超えています（省略せず保留）。');
+  const text = checkedModelText(mail);
   await localModelDigest(model);
   const unwrapped = unwrapForward(mail);
   const response = await fetch('http://127.0.0.1:11434/api/chat', {
@@ -233,12 +271,12 @@ export async function extractWithOllama(
       ],
     }),
   });
-  if (!response.ok) throw new Error(`Ollama応答エラー: HTTP ${response.status}`);
+  if (!response.ok) throw new OllamaError(`Ollama応答エラー: HTTP ${response.status}`);
   return validateExtraction(JSON.parse(await readOllamaChat(response)));
 }
 
 export async function readOllamaChat(response: Response): Promise<string> {
-  if (!response.body) throw new Error('Ollamaの応答本文が空です。');
+  if (!response.body) throw new OllamaError('Ollamaの応答本文が空です。');
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '',
@@ -252,10 +290,11 @@ export async function readOllamaChat(response: Response): Promise<string> {
       done?: boolean;
       done_reason?: string;
     };
-    if (chunk.error) throw new Error('Ollamaの生成中にエラーが発生しました。');
+    if (chunk.error) throw new OllamaError('Ollamaの生成中にエラーが発生しました。');
     content += chunk.message?.content ?? '';
-    if (content.length > 2_000_000) throw new Error('Ollamaの出力上限を超えました。');
-    if (chunk.done_reason === 'length') throw new Error('LLM出力が上限に到達しました。');
+    if (content.length > 2_000_000) throw new OllamaError('Ollamaの出力上限を超えました。');
+    if (chunk.done_reason === 'length')
+      throw new OllamaError('LLM出力が上限に到達したため要確認です。', true);
     if (chunk.done) done = true;
   };
   try {
@@ -267,11 +306,11 @@ export async function readOllamaChat(response: Response): Promise<string> {
         consume(buffer.slice(0, end));
         buffer = buffer.slice(end + 1);
       }
-      if (buffer.length > 2_000_000) throw new Error('Ollamaの応答行が大きすぎます。');
+      if (buffer.length > 2_000_000) throw new OllamaError('Ollamaの応答行が大きすぎます。');
       if (part.done) break;
     }
     if (buffer.trim()) consume(buffer);
-    if (!done || !content.trim()) throw new Error('Ollamaの応答が途中で終了しました。');
+    if (!done || !content.trim()) throw new OllamaError('Ollamaの応答が途中で終了しました。');
     return content;
   } finally {
     await reader.cancel().catch(() => {});

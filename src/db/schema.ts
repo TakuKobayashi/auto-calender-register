@@ -10,7 +10,7 @@ import {
 } from 'drizzle-orm/pg-core';
 import type { CollectedMail } from '../collect.js';
 import type { MailPlan } from '../classify.js';
-import type { Extraction } from '../ollama.js';
+import type { CachedExtraction } from '../ollama.js';
 import type { SyncRow } from '../google-calendar.js';
 
 const recordColumns = () => ({
@@ -52,7 +52,7 @@ export const extractions = pgTable('extractions', {
   ...recordColumns(),
   key: text('key').notNull().unique(),
   model: text('model').notNull(),
-  data: jsonb('data').$type<Extraction>().notNull(),
+  data: jsonb('data').$type<CachedExtraction>().notNull(),
 });
 
 export const runs = pgTable(

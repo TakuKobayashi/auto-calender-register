@@ -174,6 +174,82 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
         await store.lock('same-calendar')
       )();
     });
+    await t.test(
+      'output-limit reviews are cached and explicit retry can replace them with a valid extraction',
+      async (t) => {
+        let inferenceCalls = 0;
+        t.mock.method(globalThis, 'fetch', async (input: string | URL | Request) => {
+          if (String(input).endsWith('/api/tags'))
+            return Response.json({ models: [{ name: 'length-test', digest: 'c'.repeat(64) }] });
+          if (String(input).endsWith('/api/show'))
+            return Response.json({ details: { format: 'gguf' } });
+          inferenceCalls++;
+          return new Response(
+            JSON.stringify(
+              inferenceCalls === 1
+                ? { message: { content: '{' }, done: true, done_reason: 'length' }
+                : {
+                    message: {
+                      content: JSON.stringify({
+                        intent: 'not_event',
+                        reason: '予定なし',
+                        evidence: '',
+                        events: [],
+                      }),
+                    },
+                    done: true,
+                    done_reason: 'stop',
+                  },
+            ) + '\n',
+          );
+        });
+        const collection: Collection = {
+          version: 1,
+          mailbox: 'INBOX',
+          uidValidity: '1',
+          since: since.toISOString(),
+          collectedAt: new Date().toISOString(),
+          matched: 1,
+          complete: true,
+          messages: [mail],
+          errors: [],
+          sourceScope: scope,
+        };
+        const first = await writeDryRun(
+          collection,
+          directory,
+          undefined,
+          new Date('2026-11-17T00:00:00Z'),
+          'length-test',
+          store,
+        );
+        assert.equal(first.complete, true);
+        assert.equal(first.summary.review, 1);
+        assert.equal(first.proposed.length, 0);
+        const second = await writeDryRun(
+          collection,
+          directory,
+          undefined,
+          new Date('2026-11-17T00:00:00Z'),
+          'length-test',
+          store,
+        );
+        assert.equal(second.summary.review, 1);
+        assert.equal(inferenceCalls, 1);
+        const third = await writeDryRun(
+          collection,
+          directory,
+          undefined,
+          new Date('2026-11-17T00:00:00Z'),
+          'length-test',
+          store,
+          { retryReviews: true },
+        );
+        assert.equal(third.complete, true);
+        assert.equal(third.summary.review, 0);
+        assert.equal(inferenceCalls, 2);
+      },
+    );
     const eventKey = 'a'.repeat(64);
     const selected: SelectedEvent = {
       sourceUid: 1,

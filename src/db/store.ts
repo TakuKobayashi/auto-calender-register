@@ -5,7 +5,7 @@ import pg from 'pg';
 import * as tables from './schema.js';
 import type { Collection, CollectedMail } from '../collect.js';
 import type { MailPlan } from '../classify.js';
-import type { Extraction } from '../ollama.js';
+import type { CachedExtraction } from '../ollama.js';
 import type { SelectedEvent } from '../selection.js';
 import type { SyncRow } from '../google-calendar.js';
 import { databaseUrl } from './connection.js';
@@ -171,8 +171,11 @@ export class Store {
       await this.db.select().from(tables.extractions).where(eq(tables.extractions.key, key))
     )[0]?.data;
   }
-  async saveExtraction(key: string, model: string, data: Extraction) {
-    await this.db.insert(tables.extractions).values({ key, model, data }).onConflictDoNothing();
+  async saveExtraction(key: string, model: string, data: CachedExtraction) {
+    await this.db
+      .insert(tables.extractions)
+      .values({ key, model, data })
+      .onConflictDoUpdate({ target: tables.extractions.key, set: { model, data } });
   }
   async resolution(target: string, eventKey: string) {
     return (

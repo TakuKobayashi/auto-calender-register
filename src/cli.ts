@@ -120,6 +120,7 @@ program
     '既存Google予定のJSONスナップショットで重複照合（省略時は未確認）',
   )
   .option('--ollama-model <name>', 'ローカルOllamaで文脈を再判定（実験機能・モデル指定必須）')
+  .option('--retry-reviews', 'LLM出力上限等で保存した要確認結果を再推論する', false)
   .option('--database', 'PostgreSQLへ進捗・抽出結果を保存（既定で有効）', true)
   .option('--no-database', 'DBを使わずJSONのみ保存')
   .action(async (options) =>
@@ -172,6 +173,7 @@ program
           new Date(),
           options.ollamaModel,
           store,
+          { retryReviews: options.retryReviews },
         );
         output({
           mode: report.mode,
@@ -183,7 +185,14 @@ program
           json: `${options.outputDir}/dry-run.json`,
           proposed: report.proposed,
         });
-        if (!report.complete) process.exitCode = 2;
+        if (!report.complete) {
+          console.error(
+            `メール選別が未完了のため停止しました。取得・解析エラー ${report.summary.error}件。詳細: ${options.outputDir}/dry-run.md`,
+          );
+          for (const mail of report.messages.filter((m) => m.decision === 'error'))
+            console.error(`UID ${mail.uid}: ${mail.reasons.join(' / ')}`);
+          process.exitCode = 2;
+        }
         if (store && runId)
           await store.finishRun(runId, report.complete ? 'completed' : 'error', report.summary);
       } catch (error) {

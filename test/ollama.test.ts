@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { classifyMail, finalize } from '../src/classify.js';
-import type { CollectedMail } from '../src/collect.js';
+import type { CollectedMail, Collection } from '../src/collect.js';
+import { mkdtemp, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   dateSupported,
   extractionCacheKey,
@@ -13,9 +16,58 @@ import {
   type Extraction,
 } from '../src/ollama.js';
 import { filterGmailForwards, matchOriginal } from '../src/forward-audit.js';
-import { reconcileModelPlan } from '../src/dry-run.js';
+import { reconcileModelPlan, writeDryRun } from '../src/dry-run.js';
 
 const now = new Date('2026-11-16T00:00:00Z');
+
+function collection(message: CollectedMail): Collection {
+  return {
+    version: 1,
+    mailbox: 'INBOX',
+    uidValidity: '1',
+    since: '2026-10-01T00:00:00Z',
+    collectedAt: now.toISOString(),
+    matched: 1,
+    complete: true,
+    messages: [message],
+    errors: [],
+  };
+}
+
+test('長すぎる本文は推論せず要確認とし、候補を作らず処理を完了する', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => {
+    throw new Error('長文をOllamaへ送信してはいけません');
+  });
+  const directory = await mkdtemp(join(tmpdir(), 'calendar-long-mail-'));
+  const result = await writeDryRun(
+    collection(mail({ text: '予約確認\n' + '本文'.repeat(13000) })),
+    directory,
+    undefined,
+    now,
+    'unused-model',
+  );
+  assert.equal(result.complete, true);
+  assert.equal(result.summary.review, 1);
+  assert.equal(result.summary.error, 0);
+  assert.equal(result.proposed.length, 0);
+  assert.match(result.messages[0]!.reasons.join(' '), /上限24000文字/);
+});
+
+test('LLMタイムアウトは理由を保存し、未完了のまま登録を止める', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request) => {
+    if (String(input).endsWith('/api/tags'))
+      return Response.json({ models: [{ name: 'timeout-test', digest: 'a'.repeat(64) }] });
+    if (String(input).endsWith('/api/show')) return Response.json({ details: { format: 'gguf' } });
+    throw new DOMException('timeout', 'TimeoutError');
+  });
+  const directory = await mkdtemp(join(tmpdir(), 'calendar-timeout-'));
+  const result = await writeDryRun(collection(mail()), directory, undefined, now, 'timeout-test');
+  assert.equal(result.complete, false);
+  assert.equal(result.summary.error, 1);
+  assert.equal(result.proposed.length, 0);
+  assert.match(result.messages[0]!.reasons.join(' '), /制限時間/);
+  assert.match(await readFile(join(directory, 'dry-run.md'), 'utf8'), /処理エラー[\s\S]*制限時間/);
+});
 
 test('モデル更新でdigestが変われば、同じモデル名とメールでも抽出キャッシュを更新する', () => {
   const original = extractionCacheKey(mail(), 'model', 'a'.repeat(64));

@@ -10,6 +10,10 @@ import {
   extractionCacheKey,
   localModelDigest,
   validateExtraction,
+  checkedModelText,
+  OllamaError,
+  ollamaFailureReason,
+  isReviewOutcome,
 } from './ollama.js';
 import type { Store } from './db/store.js';
 import { finalize } from './classify.js';
@@ -92,6 +96,7 @@ export async function writeDryRun(
   now = new Date(),
   model?: string,
   store?: Store,
+  options: { retryReviews?: boolean } = {},
 ) {
   const overrides = new Map<number, MailPlan>();
   if (model) {
@@ -111,21 +116,43 @@ export async function writeDryRun(
       )
         continue;
       console.error(`Ollama再判定 UID ${mail.uid}`);
+      let key: string | undefined;
       try {
-        const key = extractionCacheKey(mail, model, await localModelDigest(model));
+        checkedModelText(mail);
+        key = extractionCacheKey(mail, model, await localModelDigest(model));
         const cached = await store?.getExtraction(key);
-        const extraction = cached
-          ? validateExtraction(cached)
-          : await extractWithOllama(mail, model);
-        if (!cached && store) await store.saveExtraction(key, model, extraction);
+        if (isReviewOutcome(cached) && !options.retryReviews) {
+          overrides.set(mail.uid, {
+            ...plan,
+            decision: 'review',
+            events: [],
+            reasons: [
+              ...plan.reasons,
+              cached.reason,
+              '入力・モデルが同じため保存済みの要確認結果を使用。自動登録しない',
+            ],
+          });
+          continue;
+        }
+        const extraction =
+          cached && !isReviewOutcome(cached)
+            ? validateExtraction(cached)
+            : await extractWithOllama(mail, model);
+        if ((!cached || isReviewOutcome(cached)) && store)
+          await store.saveExtraction(key, model, extraction);
         const inferred = extractionToPlan(mail, extraction, now, finalize);
         overrides.set(mail.uid, reconcileModelPlan(plan, inferred));
-      } catch {
+      } catch (error) {
+        const decision = error instanceof OllamaError && error.needsReview ? 'review' : 'error';
+        const reason = ollamaFailureReason(error);
+        if (decision === 'review' && key && store)
+          await store.saveExtraction(key, model, { kind: 'review', reason });
+        console.error(`UID ${mail.uid}: ${reason}`);
         overrides.set(mail.uid, {
           ...plan,
-          decision: 'error',
+          decision,
           events: [],
-          reasons: ['Ollamaの呼び出し・出力検証に失敗。登録しない'],
+          reasons: [...plan.reasons, reason, '自動登録しない'],
         });
       }
     }
@@ -254,6 +281,9 @@ export async function writeDryRun(
     '|---|---|---|',
   );
   for (const p of plans.filter((p) => p.decision === 'pending'))
+    lines.push(`| ${p.uid} | ${md(p.subject)} | ${md(p.reasons.join(' / '))} |`);
+  lines.push('', '## 処理エラー', '', '| 元メールUID | 件名 | 失敗理由 |', '|---|---|---|');
+  for (const p of plans.filter((p) => p.decision === 'error'))
     lines.push(`| ${p.uid} | ${md(p.subject)} | ${md(p.reasons.join(' / '))} |`);
   lines.push(
     '',
