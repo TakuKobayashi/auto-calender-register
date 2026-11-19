@@ -19,7 +19,12 @@ import { exportIcs } from './ics.js';
 import { GoogleCalendar, syncCalendarToFile } from './google-calendar.js';
 import { Store, calendarTarget } from './db/store.js';
 import { mergeMessages, sourceScope, mailLabel } from './domain/mail.js';
-import { collectYahoo, yahooAccount, normalizeYahooCache } from './sources/yahoo.js';
+import {
+  collectYahoo,
+  yahooAccount,
+  normalizeYahooCache,
+  selectYahooMailbox,
+} from './sources/yahoo.js';
 import { DrizzleQueryError } from 'drizzle-orm';
 
 async function withTracking<T>(enabled: boolean, action: (store?: Store) => Promise<T>) {
@@ -111,7 +116,7 @@ program
     '受信開始日 YYYY-MM-DD（日本時間）',
     DateTime.now().setZone('Asia/Tokyo').minus({ months: 1 }).startOf('month').toISODate()!,
   )
-  .option('--mailbox <name>', 'メールボックス名')
+  .option('--mailbox <names...>', '選別対象フォルダー（複数指定可・省略時INBOX）')
   .option('--max-bytes <number>', 'メール1件の最大取得バイト数', positiveInteger, 10 * 1024 * 1024)
   .option('--output-dir <directory>', '個人情報を含むレポートの保存先', 'reports')
   .option('--from-cache <file>', '取得済みmail-cache.jsonで再判定（メール接続なし）')
@@ -131,7 +136,10 @@ program
         runId = await store?.startRun('mail', `${mailAccount().provider}:${mailAccount().key}`);
         const since = parseSince(options.since);
         const collection = options.fromCache
-          ? normalizeYahooCache(await readCollection(options.fromCache, since), mailAccount())
+          ? selectYahooMailbox(
+              normalizeYahooCache(await readCollection(options.fromCache, since), mailAccount()),
+              options.mailbox,
+            )
           : await collectYahoo(since, options.outputDir, options.maxBytes, options.mailbox, store);
         if (store && options.fromCache) {
           collection.messages = mergeMessages(collection.messages);
@@ -174,6 +182,7 @@ program
             doNotRegister: report.summary.skip,
             errors: report.summary.error,
           },
+          llm: report.llm,
           report: `${options.outputDir}/dry-run.md`,
           json: `${options.outputDir}/dry-run.json`,
           proposed: report.proposed.map((p) => ({

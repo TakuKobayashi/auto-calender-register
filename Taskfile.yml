@@ -18,12 +18,13 @@ tasks:
       MODEL: '{{default "qwen3.5:9b" .MODEL}}'
       SINCE: '{{default "" .SINCE}}'
       CALENDAR_ID: '{{default "primary" .CALENDAR_ID}}'
+      MAILBOX: '{{default "INBOX" .MAILBOX}}'
     cmds:
       - npm run db:status
       - defer: npm run db:dump
       - npm run auth:status -- --calendar-id "{{.CALENDAR_ID}}"
       - >-
-        npm run calendar:dry-run -- --database --ollama-model "{{.MODEL}}"
+        npm run calendar:dry-run -- --database --ollama-model "{{.MODEL}}" --mailbox "{{.MAILBOX}}"
         {{if .SINCE}}--since "{{.SINCE}}"{{end}}
       - npm run calendar:ics
       - npm run calendar:register -- --database --calendar-id "{{.CALENDAR_ID}}"

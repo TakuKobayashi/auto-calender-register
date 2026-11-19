@@ -49,9 +49,15 @@ npm run task calendar:sync
 npm run task calendar:sync SINCE=2026-10-01 CALENDAR_ID=primary MODEL=qwen3.5:9b
 ```
 
-受信フォルダー全体が対象です。送信済み・下書き・迷惑メール・ごみ箱は除外します。
+既定の対象は受信箱（`INBOX`）です。複数フォルダーはカンマ区切りで指定します。
+
+```sh
+npm run task calendar:sync MAILBOX=INBOX,Shopping
+```
+
 未確定・完了・取消・過去の予定、広告、既存予定と重複するものは登録しません。
 時刻のない期限は終日表示、終了時刻のない確定予定は開始通知用の15分枠になります。
+LLM判定前に件名・本文・ICSの日付表現を確認し、日付情報のないメールは省略します。日付のない取消・完了・変更通知は判定対象です。
 登録済み予定の更新・削除には対応していません。
 
 ## 登録せずに確認

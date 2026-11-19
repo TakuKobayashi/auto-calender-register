@@ -40,7 +40,7 @@ test('長すぎる本文は推論せず要確認とし、候補を作らず処�
   });
   const directory = await mkdtemp(join(tmpdir(), 'calendar-long-mail-'));
   const result = await writeDryRun(
-    collection(mail({ text: '予約確認\n' + '本文'.repeat(13000) })),
+    collection(mail({ text: '予約確認 2026年11月20日\n' + '本文'.repeat(13000) })),
     directory,
     undefined,
     now,

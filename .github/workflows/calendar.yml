@@ -20,6 +20,10 @@ on:
         description: 'Ollamaモデル（空欄はルール方式のみ）'
         type: string
         default: 'qwen3.5:9b'
+      mailbox:
+        description: '取得対象フォルダー（複数はカンマ区切り）'
+        type: string
+        default: 'INBOX'
   # 定期実行を始める場合に有効化。schedule時の書き込みは下のREGISTER_ON_SCHEDULEで制御。
   # schedule:
   #   - cron: '17 * * * *'
@@ -47,6 +51,7 @@ jobs:
       OLLAMA_NUM_PARALLEL: '1'
       OLLAMA_MAX_LOADED_MODELS: '1'
       SCAN_SINCE: ${{ inputs.since }}
+      SCAN_MAILBOX: ${{ inputs.mailbox || 'INBOX' }}
       APPLY: ${{ inputs.apply }}
       REGISTER_ON_SCHEDULE: 'false'
     steps:
@@ -97,7 +102,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p reports
-          args=(run --silent calendar:dry-run -- --database)
+          args=(run --silent calendar:dry-run -- --database --mailbox "$SCAN_MAILBOX")
           if [[ -n "$SCAN_SINCE" ]]; then args+=(--since "$SCAN_SINCE"); fi
           if [[ -n "$OLLAMA_MODEL" ]]; then args+=(--ollama-model "$OLLAMA_MODEL"); fi
           npm "${args[@]}" > reports/selection-summary.json

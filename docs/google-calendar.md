@@ -53,6 +53,9 @@ npm run task calendar:sync
 
 ```powershell
 npm run task calendar:sync SINCE=2026-11-01 CALENDAR_ID=YOUR_CALENDAR_ID MODEL=qwen3.5:9b
+
+# 受信箱とShoppingフォルダーを対象に実行
+npm run task calendar:sync MAILBOX=INBOX,Shopping
 ```
 
 別カレンダーのIDは、Googleカレンダーの「設定」→対象カレンダー→「カレンダーの統合」で確認します。
@@ -63,6 +66,9 @@ npm run task calendar:sync SINCE=2026-11-01 CALENDAR_ID=YOUR_CALENDAR_ID MODEL=q
 ```powershell
 # 取得・選別
 npm run calendar:dry-run -- --since 2026-11-01 --ollama-model qwen3.5:9b
+
+# 別フォルダーを選別
+npm run calendar:dry-run -- --mailbox INBOX Shopping --ollama-model qwen3.5:9b
 
 # 既存予定と照合（書き込みなし）
 npm run calendar:plan -- --report reports/dry-run.json
@@ -130,6 +136,7 @@ GitHubの画面からは「Settings → Secrets and variables → Actions → Ne
 | `apply`       | `true` で登録、既定は `false`（照合のみ）           |
 | `calendar_id` | 登録先。既定は `primary`                            |
 | `model`       | Ollamaモデル。既定は `qwen3.5:9b`、空欄はルール方式 |
+| `mailbox`     | 対象フォルダー。複数はカンマ区切り、既定は `INBOX`  |
 
 定期実行はワークフローの `schedule` を有効にします。
 定期実行でも登録する場合は `REGISTER_ON_SCHEDULE` を `true` に設定してください。

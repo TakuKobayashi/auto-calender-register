@@ -32,6 +32,42 @@ export function normalizeYahooCache(collection: Collection, account = yahooAccou
   };
 }
 
+export function yahooMailboxes(names: string[] = ['INBOX']) {
+  const folders = [
+    ...new Set(
+      names
+        .flatMap((name) => name.split(','))
+        .map((name) => name.trim())
+        .filter(Boolean)
+        .map((name) => (name.toUpperCase() === 'INBOX' ? 'INBOX' : name)),
+    ),
+  ];
+  if (!folders.length) throw new Error('対象フォルダーを1つ以上指定してください。');
+  return folders;
+}
+
+export function selectYahooMailbox(collection: Collection, mailboxes?: string[]): Collection {
+  const folders = yahooMailboxes(mailboxes);
+  const matches = (name: string) =>
+    folders.includes(name.toUpperCase() === 'INBOX' ? 'INBOX' : name);
+  const messages = collection.messages.filter((mail) =>
+    matches(mail.source?.id ?? collection.mailbox),
+  );
+  const errors = collection.errors.filter((error) =>
+    matches(error.source?.id ?? collection.mailbox),
+  );
+  return {
+    ...collection,
+    mailbox: folders.join(', '),
+    ...(folders.length > 1
+      ? { uidValidity: 'multiple', source: undefined, sourceScope: undefined }
+      : {}),
+    messages: mergeMessages(messages),
+    errors,
+    matched: messages.length + errors.length,
+  };
+}
+
 export function imapReader(client: ImapFlow, account: MailAccount): MailboxReader {
   const info = mailboxInfo(client);
   const source = { account, id: info.mailbox, name: info.mailbox, generation: info.uidValidity };
@@ -95,55 +131,41 @@ export async function collectYahoo(
   since: Date,
   directory: string,
   maxBytes: number,
-  mailbox?: string,
+  mailboxes?: string[],
   store?: Store,
 ): Promise<Collection> {
   const account = yahooAccount();
-  const folders = mailbox
-    ? [mailbox]
-    : await withMailbox('INBOX', async (client) =>
-        (await client.list())
-          .filter(
-            (f) =>
-              !['\\Sent', '\\Drafts', '\\Junk', '\\Trash'].includes(f.specialUse ?? '') &&
-              !f.flags.has('\\Noselect'),
-          )
-          .map((f) => f.path),
-      );
+  const folders = yahooMailboxes(mailboxes);
   const collections: Collection[] = [];
-  for (const folder of folders) {
-    console.error(`取得フォルダー: ${folder}`);
-    const collected = await withMailbox(folder, async (client) => {
-      const generation = String(client.mailbox && client.mailbox.uidValidity);
-      const scope = sourceScope({ account, id: folder, name: folder, generation });
-      return collectSource(
-        imapReader(client, account),
-        since,
-        join(directory, 'sources', scope),
-        maxBytes,
-        store,
-      );
-    });
-    collections.push(normalizeYahooCache(collected, account));
+  for (const mailbox of folders) {
+    console.error(`取得フォルダー: ${mailbox}`);
+    collections.push(
+      await withMailbox(mailbox, async (client) => {
+        const reader = imapReader(client, account);
+        return collectSource(
+          reader,
+          since,
+          join(directory, 'sources', sourceScope(reader.source)),
+          maxBytes,
+          store,
+        );
+      }),
+    );
   }
-  const messages = mergeMessages(collections.flatMap((c) => c.messages));
   const result: Collection = {
-    version: 1,
-    mailbox: mailbox ?? 'all received folders',
-    uidValidity: 'multiple',
-    since: collections.map((c) => c.since).sort()[0] ?? since.toISOString(),
+    ...collections[0]!,
+    mailbox: folders.join(', '),
+    ...(folders.length > 1
+      ? { uidValidity: 'multiple', source: undefined, sourceScope: undefined }
+      : {}),
+    since: collections.map((collection) => collection.since).sort()[0]!,
     collectedAt: new Date().toISOString(),
-    matched: collections.reduce((n, c) => n + c.matched, 0),
-    complete: collections.every((c) => c.complete),
-    messages,
+    matched: collections.reduce((count, collection) => count + collection.matched, 0),
+    complete: collections.every((collection) => collection.complete),
+    messages: mergeMessages(collections.flatMap((collection) => collection.messages)),
     errors: collections
-      .flatMap((c) =>
-        c.errors.map((e) => ({
-          ...e,
-          source: e.source ?? { ...c.source!, messageId: String(e.uid) },
-        })),
-      )
-      .map((e, i) => ({ ...e, uid: -(i + 1) })),
+      .flatMap((collection) => collection.errors)
+      .map((error, i) => ({ ...error, uid: -(i + 1) })),
   };
   await mkdir(directory, { recursive: true });
   await writeFile(join(directory, 'mail-cache.json'), JSON.stringify(result, null, 2), {

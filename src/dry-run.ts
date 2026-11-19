@@ -18,6 +18,7 @@ import {
 import type { Store } from './db/store.js';
 import { finalize } from './classify.js';
 import { mailLabel, sourceScope } from './domain/mail.js';
+import { inspectDatePresence } from './date-presence.js';
 
 type ExistingEvent = {
   id?: string;
@@ -100,17 +101,32 @@ export async function writeDryRun(
   options: { retryReviews?: boolean } = {},
 ) {
   const overrides = new Map<number, MailPlan>();
+  const llm = { skippedNoDate: 0, lifecycleWithoutDate: 0, cacheHits: 0, requests: 0 };
   if (model) {
     const initial = classifyAll(collection.messages, now);
     for (let i = 0; i < collection.messages.length; i++) {
       const mail = collection.messages[i]!;
       const plan = initial[i]!;
-      console.error(`メールを判定: ${mailLabel(mail)}`);
       let key: string | undefined;
       try {
+        const presence = inspectDatePresence(mail);
+        if (!presence.hasDate && !presence.needsLifecycleCheck) {
+          llm.skippedNoDate++;
+          overrides.set(mail.uid, {
+            ...plan,
+            decision: 'excluded',
+            events: [],
+            reasons: [`${presence.reason}。LLM判定を省略し、登録しない`],
+          });
+          console.error(`登録しない: ${mailLabel(mail)} ｜ ${presence.reason}（LLM省略）`);
+          continue;
+        }
+        if (!presence.hasDate) llm.lifecycleWithoutDate++;
+        console.error(`メールを判定: ${mailLabel(mail)} ｜ ${presence.reason}`);
         checkedModelText(mail);
         key = extractionCacheKey(mail, model, await localModelDigest(model));
         const cached = await store?.getExtraction(key);
+        if (cached && !(isReviewOutcome(cached) && options.retryReviews)) llm.cacheHits++;
         if (isReviewOutcome(cached) && !options.retryReviews) {
           overrides.set(mail.uid, {
             ...plan,
@@ -124,6 +140,7 @@ export async function writeDryRun(
           });
           continue;
         }
+        if (!cached || isReviewOutcome(cached)) llm.requests++;
         const extraction =
           cached && !isReviewOutcome(cached)
             ? validateExtraction(cached)
@@ -195,6 +212,7 @@ export async function writeDryRun(
     schemaVersion: 1,
     mode: 'dry-run',
     model: model ?? null,
+    llm,
     executedAt: now.toISOString(),
     since: collection.since,
     mailbox: collection.mailbox,
@@ -224,6 +242,7 @@ export async function writeDryRun(
     `既存カレンダー照合: ${existingFile ? 'ローカルスナップショットのみ（最新性は未保証）' : '未接続・未確認。候補は登録確定ではありません。'}`,
     '',
     `確認メール ${plans.length}件 / 登録候補 ${proposed.length}件 / 登録しない ${plans.filter((p) => !p.shouldRegister).length}件 / 処理エラー ${counts.error}件`,
+    `LLM呼び出し ${llm.requests}件 / キャッシュ利用 ${llm.cacheHits}件 / 日付なしで省略 ${llm.skippedNoDate}件 / 日付なしの後続通知確認 ${llm.lifecycleWithoutDate}件`,
     '',
     '## 登録候補',
     '',
