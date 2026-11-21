@@ -19,6 +19,7 @@ import type { Store } from './db/store.js';
 import { finalize } from './classify.js';
 import { mailLabel, sourceScope } from './domain/mail.js';
 import { inspectDatePresence } from './date-presence.js';
+import { shortlistReason } from './mail-shortlist.js';
 
 type ExistingEvent = {
   id?: string;
@@ -101,7 +102,12 @@ export async function writeDryRun(
   options: { retryReviews?: boolean } = {},
 ) {
   const overrides = new Map<number, MailPlan>();
-  const llm = { skippedNoDate: 0, lifecycleWithoutDate: 0, cacheHits: 0, requests: 0 };
+  const llm = {
+    skippedNoDate: 0,
+    skippedByShortlist: 0,
+    cacheHits: 0,
+    requests: 0,
+  };
   if (model) {
     const initial = classifyAll(collection.messages, now);
     for (let i = 0; i < collection.messages.length; i++) {
@@ -109,20 +115,24 @@ export async function writeDryRun(
       const plan = initial[i]!;
       let key: string | undefined;
       try {
-        const presence = inspectDatePresence(mail);
-        if (!presence.hasDate && !presence.needsLifecycleCheck) {
-          llm.skippedNoDate++;
+        const shortlist = shortlistReason(mail, now);
+        if (!shortlist) {
+          const presence = inspectDatePresence(mail);
+          if (presence.hasDate) llm.skippedByShortlist++;
+          else llm.skippedNoDate++;
+          const reason = presence.hasDate
+            ? '今後の日付と予定・対応期限の手掛かりが揃わない。LLM判定を省略'
+            : '件名・本文・ICSに日付情報なし。LLM判定を省略';
           overrides.set(mail.uid, {
             ...plan,
             decision: 'excluded',
             events: [],
-            reasons: [`${presence.reason}。LLM判定を省略し、登録しない`],
+            reasons: [...plan.reasons, reason],
           });
-          console.error(`登録しない: ${mailLabel(mail)} ｜ ${presence.reason}（LLM省略）`);
+          console.error(`登録しない: ${mailLabel(mail)} ｜ ${reason}`);
           continue;
         }
-        if (!presence.hasDate) llm.lifecycleWithoutDate++;
-        console.error(`メールを判定: ${mailLabel(mail)} ｜ ${presence.reason}`);
+        console.error(`メールを判定: ${mailLabel(mail)} ｜ ${shortlist}`);
         checkedModelText(mail);
         key = extractionCacheKey(mail, model, await localModelDigest(model));
         const cached = await store?.getExtraction(key);
@@ -242,7 +252,7 @@ export async function writeDryRun(
     `既存カレンダー照合: ${existingFile ? 'ローカルスナップショットのみ（最新性は未保証）' : '未接続・未確認。候補は登録確定ではありません。'}`,
     '',
     `確認メール ${plans.length}件 / 登録候補 ${proposed.length}件 / 登録しない ${plans.filter((p) => !p.shouldRegister).length}件 / 処理エラー ${counts.error}件`,
-    `LLM呼び出し ${llm.requests}件 / キャッシュ利用 ${llm.cacheHits}件 / 日付なしで省略 ${llm.skippedNoDate}件 / 日付なしの後続通知確認 ${llm.lifecycleWithoutDate}件`,
+    `LLM呼び出し ${llm.requests}件 / キャッシュ利用 ${llm.cacheHits}件 / 日付なしで省略 ${llm.skippedNoDate}件 / 文字列検索で省略 ${llm.skippedByShortlist}件`,
     '',
     '## 登録候補',
     '',

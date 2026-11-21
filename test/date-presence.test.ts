@@ -107,7 +107,7 @@ for (const text of [
     assert.equal(result.needsLifecycleCheck, true);
   });
 }
-test('日付がなければモデル情報取得・推論・キャッシュ参照を呼ばない', async (t) => {
+test('日付なしと日付だけの広告はいずれもモデルを呼ばない', async (t) => {
   t.mock.method(globalThis, 'fetch', async () => {
     throw new Error('Ollamaを呼んではいけません');
   });
@@ -118,9 +118,12 @@ test('日付がなければモデル情報取得・推論・キャッシュ参�
     uidValidity: '1',
     since: '2026-10-01T00:00:00Z',
     collectedAt: '2026-11-18T00:00:00Z',
-    matched: 1,
+    matched: 2,
     complete: true,
-    messages: [mail('おすすめの新商品です')],
+    messages: [
+      mail('おすすめの新商品です'),
+      mail('2026年11月25日 12:00から数量限定セールを開催します。', { uid: 2 }),
+    ],
     errors: [],
   };
   const report = await writeDryRun(
@@ -134,35 +137,19 @@ test('日付がなければモデル情報取得・推論・キャッシュ参�
   assert.equal(report.messages[0]!.shouldRegister, false);
   assert.equal(report.messages[0]!.decision, 'excluded');
   assert.match(report.messages[0]!.reasons.join(' '), /日付情報なし/);
+  assert.equal(report.messages[1]!.shouldRegister, false);
+  assert.match(report.messages[1]!.reasons.join(' '), /手掛かりが揃わない/);
   assert.deepEqual(report.llm, {
     skippedNoDate: 1,
-    lifecycleWithoutDate: 0,
+    skippedByShortlist: 1,
     cacheHits: 0,
     requests: 0,
   });
 });
 
-test('日付のない取消通知はLLMで判定して取消状態を保持する', async (t) => {
-  let calls = 0;
-  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request) => {
-    if (String(input).endsWith('/api/tags'))
-      return Response.json({ models: [{ name: 'date-gate-test', digest: 'c'.repeat(64) }] });
-    if (String(input).endsWith('/api/show')) return Response.json({ details: { format: 'gguf' } });
-    calls++;
-    return new Response(
-      JSON.stringify({
-        message: {
-          content: JSON.stringify({
-            intent: 'cancelled',
-            reason: '予約取消済み',
-            evidence: '予約を取り消しました',
-            references: ['REF123456'],
-            events: [],
-          }),
-        },
-        done: true,
-      }) + '\n',
-    );
+test('日付のない明示的な取消通知は推論せず取消状態を保持する', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => {
+    throw new Error('Unexpected LLM request');
   });
   const directory = await mkdtemp(join(tmpdir(), 'calendar-undated-cancel-'));
   const collection: Collection = {
@@ -173,7 +160,7 @@ test('日付のない取消通知はLLMで判定して取消状態を保持す�
     collectedAt: '2026-11-18T00:00:00Z',
     matched: 1,
     complete: true,
-    messages: [mail('予約を取り消しました。受付番号：REF123456')],
+    messages: [mail('受付番号：REF123456', { subject: 'ご予約をキャンセルしました' })],
     errors: [],
   };
   const report = await writeDryRun(
@@ -183,9 +170,8 @@ test('日付のない取消通知はLLMで判定して取消状態を保持す�
     new Date('2026-11-18T00:00:00Z'),
     'date-gate-test',
   );
-  assert.equal(calls, 1);
   assert.equal(report.messages[0]!.cancelled, true);
   assert.equal(report.messages[0]!.shouldRegister, false);
-  assert.equal(report.llm.lifecycleWithoutDate, 1);
-  assert.equal(report.llm.requests, 1);
+  assert.equal(report.llm.requests, 0);
+  assert.equal(report.complete, true);
 });
