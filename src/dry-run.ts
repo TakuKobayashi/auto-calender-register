@@ -5,8 +5,6 @@ import { classifyAll, type MailPlan, type EventPlan } from './classify.js';
 import type { Collection } from './collect.js';
 import {
   extractWithOllama,
-  extractBatchWithOllama,
-  extractionInputBytes,
   extractionToPlan,
   modelText,
   extractionCacheKey,
@@ -113,7 +111,6 @@ export async function writeDryRun(
     skippedOptionalMail: 0,
     cacheHits: 0,
     requests: 0,
-    batchRequests: 0,
     uncachedMails: 0,
   };
   if (model) {
@@ -122,8 +119,6 @@ export async function writeDryRun(
     const candidates = new Set(
       filterCalendarMails(collection.messages, (mail, error) => filterErrors.set(mail, error)),
     );
-    type Pending = { mail: CollectedMail; plan: MailPlan; key: string; bytes: number };
-    const pending: Pending[] = [];
     const applyExtraction = (mail: CollectedMail, plan: MailPlan, extraction: Extraction) => {
       const inferred = extractionToPlan(mail, extraction, now, finalize);
       overrides.set(mail.uid, reconcileModelPlan(plan, inferred));
@@ -145,38 +140,6 @@ export async function writeDryRun(
         events: [],
         reasons: [...plan.reasons, reason, '自動登録しない'],
       });
-    };
-    const flush = async () => {
-      const batch = pending.splice(0);
-      if (!batch.length) return;
-      let results: (Extraction | undefined)[] = [];
-      if (batch.length > 1) {
-        llm.requests++;
-        llm.batchRequests++;
-        console.error(`LLMでまとめて判定: ${batch.length}通`);
-        try {
-          results = await extractBatchWithOllama(
-            batch.map(({ mail }) => mail),
-            model,
-          );
-        } catch (error) {
-          for (const { mail, plan } of batch) await recordFailure(mail, plan, error);
-          return;
-        }
-      }
-      for (const [index, { mail, plan, key }] of batch.entries()) {
-        try {
-          let extraction = results[index];
-          if (!extraction) {
-            llm.requests++;
-            extraction = await extractWithOllama(mail, model);
-          }
-          await store?.saveExtraction(key, model, extraction);
-          applyExtraction(mail, plan, extraction);
-        } catch (error) {
-          await recordFailure(mail, plan, error, key);
-        }
-      }
     };
     for (let i = 0; i < collection.messages.length; i++) {
       const mail = collection.messages[i]!;
@@ -212,7 +175,7 @@ export async function writeDryRun(
           console.error(`登録しない: ${mailLabel(mail)} ｜ ${reason}`);
           continue;
         }
-        const body = checkedModelText(mail);
+        checkedModelText(mail);
         key = extractionCacheKey(mail, model, await localModelDigest(model));
         const cached = await store?.getExtraction(key);
         if (cached && !(isReviewOutcome(cached) && options.retryReviews)) llm.cacheHits++;
@@ -233,18 +196,16 @@ export async function writeDryRun(
           applyExtraction(mail, plan, validateExtraction(cached));
           continue;
         }
-        const bytes = extractionInputBytes(mail, body);
-        // Leave room in the context for the prompt and up to three extractions.
-        if (pending.reduce((sum, item) => sum + item.bytes, bytes) > 5000) await flush();
         llm.uncachedMails++;
+        llm.requests++;
         console.error(`LLM判定対象: ${mailLabel(mail)} ｜ ${shortlist}`);
-        pending.push({ mail, plan, key, bytes });
-        if (pending.length === 3 || bytes > 5000) await flush();
+        const extraction = await extractWithOllama(mail, model);
+        await store?.saveExtraction(key, model, extraction);
+        applyExtraction(mail, plan, extraction);
       } catch (error) {
         await recordFailure(mail, plan, error, key);
       }
     }
-    await flush();
   }
   const plans = classifyAll(collection.messages, now, overrides);
   if (existingFile) {
@@ -324,7 +285,7 @@ export async function writeDryRun(
     `既存カレンダー照合: ${existingFile ? 'ローカルスナップショットのみ（最新性は未保証）' : '未接続・未確認。候補は登録確定ではありません。'}`,
     '',
     `確認メール ${plans.length}件 / 登録候補 ${proposed.length}件 / 登録しない ${plans.filter((p) => !p.shouldRegister).length}件 / 処理エラー ${counts.error}件`,
-    `新規LLM判定 ${llm.uncachedMails}通 / LLM呼び出し ${llm.requests}回（うち一括 ${llm.batchRequests}回） / キャッシュ利用 ${llm.cacheHits}通 / 販促・一般案内等で省略 ${llm.skippedOptionalMail}件 / 日付なしで省略 ${llm.skippedNoDate}件 / 今後の日時候補なしで省略 ${llm.skippedByShortlist}件`,
+    `新規LLM判定 ${llm.uncachedMails}通 / LLM呼び出し ${llm.requests}回 / キャッシュ利用 ${llm.cacheHits}通 / 販促・一般案内等で省略 ${llm.skippedOptionalMail}件 / 日付なしで省略 ${llm.skippedNoDate}件 / 今後の日時候補なしで省略 ${llm.skippedByShortlist}件`,
     '',
     '## 登録候補',
     '',
@@ -402,14 +363,8 @@ export function reconcileModelPlan(rule: MailPlan, inferred: MailPlan): MailPlan
       if (!extracted?.payload) continue;
       event.title = extracted.title;
       event.payload.summary = extracted.payload.summary;
-      if (extracted.calendarDetails?.length) {
-        event.calendarDetails = extracted.calendarDetails;
-        event.payload.description = [
-          ...extracted.calendarDetails,
-          '',
-          event.payload.description,
-        ].join('\n');
-      }
+      event.calendarDetails = extracted.calendarDetails;
+      event.payload.description = extracted.payload.description;
     }
     retained.reasons.push(
       ...inferred.reasons,

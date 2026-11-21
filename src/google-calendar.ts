@@ -156,6 +156,7 @@ export type SyncRow = {
     | 'would_create'
     | 'duplicate'
     | 'possible_duplicate'
+    | 'previously_registered'
     | 'previously_deleted'
     | 'past'
     | 'skipped'
@@ -163,12 +164,15 @@ export type SyncRow = {
   googleEventId?: string;
   reason?: string;
 };
+type FindRegistration = (event: SelectedEvent) => Promise<{ googleEventId?: string } | undefined>;
+
 export async function syncCalendar(
   selection: Selection,
   port: CalendarPort,
   options: {
     apply: boolean;
     now?: () => Date;
+    findRegistration?: FindRegistration;
     checkpoint?: (rows: SyncRow[]) => Promise<void>;
   },
 ) {
@@ -194,8 +198,13 @@ export async function syncCalendar(
       )
         row.action = 'past';
       else {
-        const match = await findExisting(port, selected, withinBatch);
-        if (match) {
+        const registration = await options.findRegistration?.(selected);
+        const match = registration ? undefined : await findExisting(port, selected, withinBatch);
+        if (registration) {
+          row.action = 'previously_registered';
+          row.googleEventId = registration.googleEventId;
+          row.reason = 'このカレンダーへの登録履歴があるため再登録しない';
+        } else if (match) {
           row.action = match.kind;
           row.googleEventId = match.event.id;
           row.reason = match.reason;
@@ -264,6 +273,7 @@ export async function syncCalendarToFile(
     apply: boolean;
     calendarId: string;
     output: string;
+    findRegistration?: FindRegistration;
     checkpoint?: (rows: SyncRow[]) => Promise<void>;
   },
 ) {
@@ -288,6 +298,7 @@ export async function syncCalendarToFile(
   await write([], false);
   const rows = await syncCalendar(selection, port, {
     apply: options.apply,
+    findRegistration: options.findRegistration,
     checkpoint: async (rows) => {
       await options.checkpoint?.(rows);
       await write(rows, false);

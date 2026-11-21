@@ -1,12 +1,12 @@
 import { createHash } from 'node:crypto';
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, or, sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import pg from 'pg';
 import * as tables from './schema.js';
 import type { Collection, CollectedMail } from '../collect.js';
 import type { MailPlan } from '../classify.js';
 import type { CachedExtraction } from '../ollama.js';
-import type { SelectedEvent } from '../selection.js';
+import { googleEventId, type SelectedEvent } from '../selection.js';
 import type { SyncRow } from '../google-calendar.js';
 import { databaseUrl } from './connection.js';
 import { sourceScope, type MailboxSource, type MailAccount } from '../domain/mail.js';
@@ -223,6 +223,39 @@ export class Store {
       .insert(tables.extractions)
       .values({ key, model, data })
       .onConflictDoUpdate({ target: tables.extractions.key, set: { model, data } });
+  }
+  async findRegistration(target: string, selected: SelectedEvent) {
+    const { calendarStates, syncAttempts, mails, mailboxes } = tables;
+    const action = sql<string>`${syncAttempts.row}->>'action'`;
+    const eventId = sql<string | null>`${syncAttempts.row}->>'googleEventId'`;
+    const source = selected.source;
+    const [registration] = await this.db
+      .select({ googleEventId: eventId })
+      .from(calendarStates)
+      .innerJoin(syncAttempts, eq(syncAttempts.calendarStateId, calendarStates.id))
+      .innerJoin(mails, eq(calendarStates.sourceMailId, mails.id))
+      .innerJoin(mailboxes, eq(mails.mailboxId, mailboxes.id))
+      .where(
+        and(
+          eq(calendarStates.target, target),
+          or(
+            eq(calendarStates.eventKey, selected.eventKey),
+            source &&
+              and(
+                eq(mailboxes.scope, sourceScope(source)),
+                eq(mails.providerMessageId, source.messageId),
+                eq(calendarStates.start, new Date(selected.payload.start.dateTime)),
+              ),
+          ),
+          or(
+            inArray(action, ['created', 'previously_deleted']),
+            and(eq(action, 'duplicate'), eq(eventId, googleEventId(selected.eventKey))),
+          ),
+        ),
+      )
+      .orderBy(desc(syncAttempts.id))
+      .limit(1);
+    return registration ? { googleEventId: registration.googleEventId ?? undefined } : undefined;
   }
   async saveSync(
     runId: number,

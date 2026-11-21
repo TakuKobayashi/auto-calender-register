@@ -173,8 +173,77 @@ test('予定日時・会場・確定の引用が正しければ登録用payload�
   assert.equal(result.events[0]?.payload?.start.dateTime, '2026-11-20T15:00:00.000+09:00');
   assert.equal(result.events[0]?.payload?.end.dateTime, '2026-11-21T10:00:00.000+09:00');
   const description = result.events[0]!.payload!.description;
-  assert.ok(description.startsWith('受付で身分証を提示してください。'));
-  assert.doesNotMatch(description, /朝食は無料|123456/);
+  assert.equal(description, '受付で身分証を提示してください。');
+});
+
+test('メールは1通ずつ判定し、カレンダー本文には原文にある実用情報だけを載せる', async (t) => {
+  const hotel = mail({
+    text:
+      mail().text + '\n予約番号: 1793129809 (支払済: ¥6,402)\n施設連絡先: frontdesk@example.com',
+  });
+  const notice = mail({
+    uid: 2,
+    subject: '定期案内',
+    text: '2026年11月20日 15:00 にお知らせを掲載します。',
+  });
+  const modelResult = extraction({ references: ['1793129809'] });
+  modelResult.events[0]!.calendarNotes = [
+    {
+      text: '予約ID：1793129809（支払済 ¥6,402）',
+      evidence: '予約番号: 1793129809 (支払済: ¥6,402)',
+    },
+    {
+      text: 'チェックイン：11/20 15:00',
+      evidence: 'チェックイン:2026年11月20日 15:00',
+    },
+    {
+      text: 'チェックイン: 11/20 15:00',
+      evidence: 'チェックイン:2026年11月20日 15:00',
+    },
+    {
+      text: '施設連絡先：frontdesk@example.com',
+      evidence: '施設連絡先: frontdesk@example.com',
+    },
+    { text: '朝食付き', evidence: '無料の朝食をご用意しています' },
+  ];
+  const calls: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).endsWith('/api/tags'))
+      return Response.json({ models: [{ name: 'calendar-notes-test', digest: 'a'.repeat(64) }] });
+    if (String(input).endsWith('/api/show')) return Response.json({ details: { format: 'gguf' } });
+    assert.ok(String(input).endsWith('/api/chat'));
+    const request = JSON.parse(String(init?.body));
+    const payload = JSON.parse(request.messages.at(-1).content);
+    assert.equal(payload.mails, undefined);
+    calls.push(payload.subject);
+    const reply =
+      payload.subject === hotel.subject
+        ? modelResult
+        : extraction({ intent: 'not_event', events: [] });
+    return new Response(
+      JSON.stringify({ message: { content: JSON.stringify(reply) }, done: true }) + '\n',
+    );
+  });
+  const directory = await mkdtemp(join(tmpdir(), 'calendar-notes-'));
+  const report = await writeDryRun(
+    { ...collection(hotel), messages: [hotel, notice], matched: 2 },
+    directory,
+    undefined,
+    now,
+    'calendar-notes-test',
+  );
+  assert.equal(report.complete, true);
+  assert.deepEqual(calls, [hotel.subject, notice.subject]);
+  assert.equal(report.llm.requests, 2);
+  assert.equal(report.proposed.length, 1);
+  assert.equal(
+    report.proposed[0]!.payload!.description,
+    [
+      '予約ID：1793129809（支払済 ¥6,402）',
+      'チェックイン：11/20 15:00',
+      '施設連絡先：frontdesk@example.com',
+    ].join('\n'),
+  );
 });
 
 test('モデルが日付を捏造しても原文との照合で保留', () => {
@@ -255,11 +324,15 @@ test('LLMも確定と判断し開始日時が一致するとき、ルールで�
   const rule = extractionToPlan(mail(), extraction(), now, finalize);
   const partial = extraction();
   partial.events[0]!.endLocal = null;
+  partial.events[0]!.calendarNotes = [
+    { text: 'チェックイン：11/20 15:00', evidence: 'チェックイン:2026年11月20日 15:00' },
+  ];
   const inferred = extractionToPlan(mail(), partial, now, finalize);
   assert.equal(inferred.decision, 'candidate');
   const merged = reconcileModelPlan(rule, inferred);
   assert.equal(merged.decision, 'candidate');
   assert.equal(merged.events[0]?.payload?.end.dateTime, '2026-11-21T10:00:00.000+09:00');
+  assert.equal(merged.events[0]?.payload?.description, 'チェックイン：11/20 15:00');
 });
 
 test('LLMが場所を捏造した場合も自動登録しない', () => {

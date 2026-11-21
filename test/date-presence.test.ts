@@ -231,7 +231,6 @@ test('日時候補がないメールや販促メールはモデルを呼ばな�
     skippedOptionalMail: 1,
     cacheHits: 0,
     requests: 0,
-    batchRequests: 0,
     uncachedMails: 0,
   });
 });

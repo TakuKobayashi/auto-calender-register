@@ -37,12 +37,18 @@ export function checkedModelText(mail: CollectedMail) {
   return text;
 }
 
-// Version the extraction contract and input. Optional calendar copy can be
-// absent in cached entries and does not invalidate completed extractions.
 export function extractionCacheKey(mail: CollectedMail, model: string, modelDigest: string) {
   const input = modelInput(mail, modelText(mail));
   return createHash('sha256')
-    .update(JSON.stringify({ instructions, extractionSchema, input, model, modelDigest }))
+    .update(
+      JSON.stringify({
+        prompt: calendarPrompt,
+        schema: calendarExtractionSchema,
+        input,
+        model,
+        modelDigest,
+      }),
+    )
     .digest('hex');
 }
 
@@ -56,10 +62,6 @@ function modelInput(mail: CollectedMail, body: string) {
   };
 }
 
-export function extractionInputBytes(mail: CollectedMail, body: string) {
-  return Buffer.byteLength(JSON.stringify(modelInput(mail, body)));
-}
-
 export type Intent =
   'confirmed' | 'pending' | 'cancelled' | 'completed' | 'marketing' | 'not_event' | 'unclear';
 export type Extraction = {
@@ -71,6 +73,7 @@ export type Extraction = {
     kind?: 'appointment' | 'deadline';
     title: string;
     calendarDetails?: string[];
+    calendarNotes?: { text: string; evidence: string }[];
     startBasis?: 'text' | 'notification';
     startLocal: string | null;
     endLocal: string | null;
@@ -235,10 +238,15 @@ startEvidence/endEvidence/zoneEvidence/confirmationEvidence/evidenceは本文に
 referencesには本文の予約・注文・受付・配送・手続き等を一意に対応付ける番号だけを原文のまま返します。推測しません。広告や署名の一般的な会員番号は使いません。複数の独立した予定は別イベントにします。本人の確定した用事がなければeventsは空配列です。`;
 
 const calendarInstructions =
-  '\nカレンダーのtitleは、何の予定かが一覧で分かる短い文にします。対応期限は「何をするか」が分かる行動名にします。calendarDetailsには、当日必要になる情報（集合・受付、持ち物、何をどこで行うか、手続きなど）を示す本文の短い連続引用を最大3件返します。同じ文は繰り返さず、裏付けがなければ空配列にします。認証コード、アクセス用リンク、個人識別番号、注文番号などはtitleやcalendarDetailsへ転記しません。';
+  '\nカレンダーのtitleは予定や行動が分かる短い名前にします。' +
+  'calendarNotesは予定をこなすとき役立つ事実の要約です。1項目を短い1行にし、textに「項目：内容」、evidenceにその事実を裏付ける最短の連続した原文を返してください。' +
+  '該当する場合は、予約番号、支払い状況・金額、現地のチェックイン・チェックアウト、部屋や人数、設備、取消条件、施設連絡先、集合・受付・持ち物を優先します。連絡先と予約番号は原文どおりにします。' +
+  '同じ情報は一度だけ書きます。補足がなければ日時を1行だけ返し、それも裏付けがなければ空配列にします。現地の時刻は、日本時間や台湾時間など読み手に分かる表記にします。' +
+  '件名、送信者ヘッダー、Message-ID、判定の根拠や処理の説明、認証コード、暗証番号、パスワード、個人識別番号、アクセス用リンクはtextに入れません。';
 const periodInstructions =
   '\n利用可能期間や受付期間の判定では、まずこのメールが利用開始を知らせる初回通知かを、件名と本文の両方で確かめます。開始通知で、本文に明示の開始日がない場合は startBasis="notification"、startLocal=null、endLocal=本文の最終日とします。例えば利用の準備が整ったことと、利用可能な最終日が通知された場合です。startEvidenceには利用可能と分かる本文の原文を、endEvidenceには最終日を含む原文を引用します。開始日の記載がある場合やリマインダーでは startBasis="text" とし、リマインダーの送信日を開始日にしません。時刻の記載がない日はYYYY-MM-DDを返し、00:00や23:59を補いません。最終日は当日を含みます。zoneEvidenceには実在する地名や時差の原文を引用してください。';
 const calendarEventSchema = extractionSchema.properties.events.items;
+const calendarPrompt = instructions + calendarInstructions + periodInstructions;
 const calendarExtractionSchema = {
   ...extractionSchema,
   properties: {
@@ -250,13 +258,21 @@ const calendarExtractionSchema = {
         properties: {
           ...calendarEventSchema.properties,
           startBasis: { type: 'string', enum: ['text', 'notification'] },
-          calendarDetails: {
+          calendarNotes: {
             type: 'array',
-            maxItems: 3,
-            items: { type: 'string', maxLength: 180 },
+            maxItems: 7,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                text: { type: 'string', maxLength: 120 },
+                evidence: { type: 'string', maxLength: 180 },
+              },
+              required: ['text', 'evidence'],
+            },
           },
         },
-        required: [...calendarEventSchema.required, 'calendarDetails', 'startBasis'],
+        required: [...calendarEventSchema.required, 'calendarNotes', 'startBasis'],
       },
     },
   },
@@ -302,6 +318,20 @@ export function validateExtraction(value: unknown): Extraction {
         event.calendarDetails.some((detail) => typeof detail !== 'string' || detail.length > 180))
     )
       throw new OllamaError('カレンダー説明の形式不正');
+    if (
+      event.calendarNotes !== undefined &&
+      (!Array.isArray(event.calendarNotes) ||
+        event.calendarNotes.length > 7 ||
+        event.calendarNotes.some(
+          (note) =>
+            !note ||
+            typeof note.text !== 'string' ||
+            note.text.length > 120 ||
+            typeof note.evidence !== 'string' ||
+            note.evidence.length > 180,
+        ))
+    )
+      throw new OllamaError('カレンダー説明の形式不正');
     for (const key of [
       'title',
       'location',
@@ -329,80 +359,13 @@ export async function extractWithOllama(
   return validateExtraction(
     await requestExtraction(
       model,
-      instructions + calendarInstructions + periodInstructions,
+      calendarPrompt,
       calendarExtractionSchema,
       input,
       2000,
       timeoutMs,
     ),
   );
-}
-
-export async function extractBatchWithOllama(
-  mails: CollectedMail[],
-  model: string,
-): Promise<(Extraction | undefined)[]> {
-  const input = mails.map((mail, index) => ({
-    id: index + 1,
-    ...modelInput(mail, checkedModelText(mail)),
-  }));
-  const schema = {
-    type: 'object',
-    additionalProperties: false,
-    required: ['results'],
-    properties: {
-      results: {
-        type: 'array',
-        minItems: mails.length,
-        maxItems: mails.length,
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          required: ['id', 'extraction'],
-          properties: {
-            id: { type: 'integer', minimum: 1, maximum: mails.length },
-            extraction: calendarExtractionSchema,
-          },
-        },
-      },
-    },
-  };
-  let value: unknown;
-  try {
-    value = await requestExtraction(
-      model,
-      instructions +
-        calendarInstructions +
-        periodInstructions +
-        '\n複数のメールを独立して判定します。入力の各idに対して1件のresultsをidとextractionで返してください。別のメールから根拠や日時を引用しないでください。',
-      schema,
-      { mails: input },
-      2000 * mails.length,
-    );
-  } catch (error) {
-    // Retry individual messages only for unusable output, not connection failures.
-    if (!(error instanceof SyntaxError || (error instanceof OllamaError && error.needsReview)))
-      throw error;
-  }
-  const results = (value as { results?: unknown } | undefined)?.results;
-  const extractions: (Extraction | undefined)[] = Array.from({ length: mails.length });
-  const seen = new Set<number>();
-  if (!Array.isArray(results)) return extractions;
-  for (const result of results) {
-    const id: number = result?.id;
-    if (!Number.isInteger(id) || id < 1 || id > mails.length) continue;
-    if (seen.has(id)) {
-      extractions[id - 1] = undefined;
-      continue;
-    }
-    seen.add(id);
-    try {
-      extractions[id - 1] = validateExtraction(result.extraction);
-    } catch (error) {
-      if (!(error instanceof OllamaError)) throw error;
-    }
-  }
-  return extractions;
 }
 
 async function requestExtraction(
@@ -547,7 +510,7 @@ export function extractionToPlan(
   mail: CollectedMail,
   extraction: Extraction,
   now: Date,
-  finalize: (event: EventPlan, now: Date, mail: CollectedMail) => EventPlan,
+  finalize: (event: EventPlan, now: Date) => EventPlan,
 ): MailPlan {
   const text = modelText(mail);
   const base: MailPlan = {
@@ -709,16 +672,28 @@ export function extractionToPlan(
       eligible = false;
       reasons.push('予定の場所を原文で確認できない');
     }
-    const calendarDetails = [
-      ...new Set((e.calendarDetails ?? []).map((detail) => detail.trim())),
-    ].filter(
-      (detail) =>
-        quoteExists(text, detail) &&
-        !/https?:\/\/|\[URL\]|認証コード|受取コード|受け取りコード|暗証番号|パスワード|注文番号|QRコード|\b(?:PIN|passcode|password|access code)\b/i.test(
-          detail.normalize('NFKC'),
-        ) &&
-        !(extraction.references ?? []).some((ref) => ref && detail.includes(ref)),
-    );
+    const notes =
+      e.calendarNotes ??
+      (e.calendarDetails ?? []).map((detail) => ({ text: detail, evidence: detail }));
+    const calendarDetails: string[] = [];
+    const seenDetails = new Set<string>();
+    for (const note of notes) {
+      const detail = note.text.replace(/\s+/g, ' ').trim();
+      const normalized = detail.normalize('NFKC');
+      const key = normalized.toLowerCase().replace(/\s+/g, '');
+      if (
+        !key ||
+        seenDetails.has(key) ||
+        !quoteExists(text, note.evidence) ||
+        /https?:\/\/|\[URL\]|認証コード|受(?:け)?取(?:り)?コード|暗証番号|パスワード|QRコード|\b(?:PIN|passcode|password|access code)\b/i.test(
+          normalized,
+        ) ||
+        /^(?:送信元|差出人|件名|Message-ID|根拠)\s*:/i.test(normalized)
+      )
+        continue;
+      seenDetails.add(key);
+      calendarDetails.push(detail);
+    }
     const plan = finalize(
       {
         title: e.title,
@@ -753,7 +728,6 @@ export function extractionToPlan(
         decision: eligible ? 'candidate' : 'review',
       },
       now,
-      mail,
     );
     base.events.push(plan);
   }

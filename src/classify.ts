@@ -138,7 +138,7 @@ function eventKey(plan: EventPlan) {
     .digest('hex');
 }
 
-export function finalize(plan: EventPlan, now: Date, mail: CollectedMail): EventPlan {
+export function finalize(plan: EventPlan, now: Date): EventPlan {
   if (plan.cancelled) {
     plan.decision = 'excluded';
     plan.reasons.push('キャンセル通知');
@@ -157,15 +157,7 @@ export function finalize(plan: EventPlan, now: Date, mail: CollectedMail): Event
       ...(plan.allDayDate ? { allDayDate: plan.allDayDate } : {}),
       summary: plan.title,
       location: plan.location,
-      description: [
-        ...(plan.calendarDetails?.length ? plan.calendarDetails : ['メールから抽出した予定']),
-        '',
-        `送信元: ${mail.from}`,
-        `件名: ${mail.subject}`,
-        `Message-ID: ${mail.messageId ?? ''}`,
-        `根拠: ${plan.evidence}`,
-        ...plan.reasons,
-      ].join('\n'),
+      description: plan.calendarDetails?.join('\n') ?? '',
       start: { dateTime: plan.start, ...zone },
       end: {
         dateTime: plan.end,
@@ -244,7 +236,7 @@ function calendarEvents(mail: CollectedMail, now: Date): EventPlan[] {
         plans.push(plan);
         continue;
       }
-      plans.push(finalize(plan, now, mail));
+      plans.push(finalize(plan, now));
     }
   }
   return plans;
@@ -406,7 +398,7 @@ function textEvents(mail: CollectedMail, now: Date): EventPlan[] {
       plan.decision = 'excluded';
       plan.reasons.push('どのタイムゾーンでも既に過去の日付');
     }
-    plans.push(finalize(plan, now, mail));
+    plans.push(finalize(plan, now));
   }
   return plans;
 }

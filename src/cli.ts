@@ -327,6 +327,7 @@ calendarCommands
         );
         const result = await syncCalendarToFile(selection, api, {
           ...options,
+          findRegistration: store ? (event) => store.findRegistration(target, event) : undefined,
           checkpoint:
             store && runId
               ? async (rows) => {

@@ -15,7 +15,7 @@ import { collectSource } from '../src/collect.js';
 import { collectImapMailbox as collect } from '../src/sources/yahoo.js';
 import { extractionCacheKey, type Extraction } from '../src/ollama.js';
 import { writeDryRun } from '../src/dry-run.js';
-import { syncCalendar, type CalendarPort } from '../src/google-calendar.js';
+import { syncCalendar, syncCalendarToFile, type CalendarPort } from '../src/google-calendar.js';
 import { googleEventId, type SelectedEvent } from '../src/selection.js';
 import { databaseUrl } from '../src/db/connection.js';
 
@@ -126,10 +126,10 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
     };
     await store.saveMail(scope, mail);
     await t.test(
-      'cached mail skips inference and uncached mail is batched, retried if missing, and saved',
+      'cached mail skips inference and each uncached mail is processed once and saved',
       async (t) => {
         const digest = 'a'.repeat(64);
-        const calls: string[][] = [];
+        const calls: string[] = [];
         const extraction: Extraction = {
           intent: 'not_event',
           reason: '予定ではない',
@@ -149,24 +149,15 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
             assert.ok(path.endsWith('/api/chat'));
             const request = JSON.parse(String(init?.body));
             const payload = JSON.parse(request.messages.at(-1).content);
-            const subjects: string[] = payload.mails?.map(
-              (m: { subject: string }) => m.subject,
-            ) ?? [payload.subject];
-            calls.push(subjects);
-            const reply = payload.mails
-              ? {
-                  results: [
-                    { id: 3, extraction: { ...extraction, reason: 'third' } },
-                    { id: 1, extraction: { ...extraction, reason: 'first' } },
-                  ],
-                }
-              : { ...extraction, reason: 'retry' };
+            assert.equal(payload.mails, undefined);
+            calls.push(payload.subject);
+            const reply = { ...extraction, reason: payload.subject };
             return new Response(
               JSON.stringify({ message: { content: JSON.stringify(reply) }, done: true }) + '\n',
             );
           },
         );
-        const messages = ['cached', 'first', 'missing', 'third'].map((label, i) => ({
+        const messages = ['cached', 'first', 'second', 'third'].map((label, i) => ({
           ...mail,
           source: undefined,
           uid: i + 1,
@@ -199,18 +190,20 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
         const report = await run();
         assert.equal(report.complete, true);
         assert.equal(report.llm.cacheHits, 1);
-        assert.equal(report.llm.batchRequests, 1);
-        assert.equal(report.llm.requests, 2);
-        assert.deepEqual(calls, [messages.slice(1).map((m) => m.subject), [messages[2]!.subject]]);
+        assert.equal(report.llm.requests, 3);
+        assert.deepEqual(
+          calls,
+          messages.slice(1).map((m) => m.subject),
+        );
         assert.deepEqual(
           report.messages.slice(1).map((m) => m.reasons[0]),
-          ['ローカルLLM: first', 'ローカルLLM: retry', 'ローカルLLM: third'],
+          messages.slice(1).map((m) => `ローカルLLM: ${m.subject}`),
         );
         const repeat = await run();
         assert.equal(repeat.complete, true);
         assert.equal(repeat.llm.cacheHits, 4);
         assert.equal(repeat.llm.requests, 0);
-        assert.equal(calls.length, 2);
+        assert.equal(calls.length, 3);
         assert.notEqual(extractionCacheKey(messages[0]!, 'test-model', 'b'.repeat(64)), key);
         assert.equal((await store.cachedMails(scope)).size, 2);
       },
@@ -358,6 +351,81 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
       },
     );
     await t.test(
+      'deleted calendar events stay excluded using the saved registration history',
+      async () => {
+        const historyTarget = 'registration-history';
+        let apiCalls = 0;
+        const port: CalendarPort = {
+          get: async () => {
+            apiCalls++;
+            return null;
+          },
+          list: async () => {
+            apiCalls++;
+            return [];
+          },
+          insert: async (payload) => {
+            apiCalls++;
+            return payload;
+          },
+        };
+        const sync = async (event: SelectedEvent, target = historyTarget, apply = true) => {
+          const runId = await store.startRun(apply ? 'calendar:apply' : 'calendar:preview', target);
+          return syncCalendarToFile(
+            {
+              executedAt: new Date().toISOString(),
+              events: [event],
+              pastSkipped: 0,
+              repeatedSkipped: 0,
+            },
+            port,
+            {
+              apply,
+              calendarId: 'primary',
+              output: join(directory, 'registration-history.json'),
+              findRegistration: (event) => store.findRegistration(target, event),
+              checkpoint: apply
+                ? async (rows) => store.saveSync(runId, target, 'primary', event, rows.at(-1)!)
+                : undefined,
+            },
+          );
+        };
+        assert.equal(await store.findRegistration(target, selected), undefined);
+        const first = await sync(selected);
+        assert.equal(first.calendarWrites, 1);
+        assert.equal(first.rows[0]?.googleEventId, googleEventId(eventKey));
+
+        // Google no longer returns either the event or its tombstone after deletion.
+        apiCalls = 0;
+        for (const apply of [false, true, true]) {
+          const result = await sync(selected, historyTarget, apply);
+          assert.equal(result.complete, true);
+          assert.equal(result.calendarWrites, 0);
+          assert.equal(result.rows[0]?.action, 'previously_registered');
+          assert.equal(result.rows[0]?.shouldRegister, false);
+          assert.equal(result.rows[0]?.googleEventId, googleEventId(eventKey));
+        }
+
+        const newKey = 'b'.repeat(64);
+        const regenerated = {
+          ...selected,
+          eventKey: newKey,
+          payload: {
+            ...selected.payload,
+            summary: '新しい抽出タイトル',
+            extendedProperties: { private: { sourceEventKey: newKey } },
+          },
+        };
+        const sameMailAndStart = await sync(regenerated);
+        assert.equal(sameMailAndStart.rows[0]?.action, 'previously_registered');
+        assert.equal(apiCalls, 0);
+        assert.equal(
+          (await sync(selected, 'other-calendar', false)).rows[0]?.action,
+          'would_create',
+        );
+      },
+    );
+    await t.test(
       'Gmail native ids remain strings and are isolated by service and account',
       async () => {
         const gmail = {
@@ -421,8 +489,12 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
         await restoreDatabase(store, join(directory, 'dump'), true);
         assert.deepEqual((await store.cachedMails(scope)).get('1'), mail);
         assert.equal(
-          (await store.pool.query('select should_register from calendar_states')).rows[0]
-            .should_register,
+          (
+            await store.pool.query(
+              'select should_register from calendar_states where target = $1',
+              [target],
+            )
+          ).rows[0].should_register,
           false,
         );
         // A valid manifest with invalid SQL must roll back the earlier truncation and INSERTs too.
