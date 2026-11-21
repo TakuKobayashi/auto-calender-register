@@ -7,6 +7,7 @@ import { mailLabel, type MessageSource } from './domain/mail.js';
 
 export type Decision = 'candidate' | 'review' | 'excluded' | 'duplicate' | 'error' | 'pending';
 export type EventPlan = {
+  calendarDetails?: string[];
   allDayDate?: string;
   kind?: 'appointment' | 'deadline';
   title: string;
@@ -156,7 +157,15 @@ export function finalize(plan: EventPlan, now: Date, mail: CollectedMail): Event
       ...(plan.allDayDate ? { allDayDate: plan.allDayDate } : {}),
       summary: plan.title,
       location: plan.location,
-      description: `メールから抽出した予定\n送信元: ${mail.from}\n件名: ${mail.subject}\nMessage-ID: ${mail.messageId ?? ''}\n根拠: ${plan.evidence}\n${plan.reasons.join('\n')}`,
+      description: [
+        ...(plan.calendarDetails?.length ? plan.calendarDetails : ['メールから抽出した予定']),
+        '',
+        `送信元: ${mail.from}`,
+        `件名: ${mail.subject}`,
+        `Message-ID: ${mail.messageId ?? ''}`,
+        `根拠: ${plan.evidence}`,
+        ...plan.reasons,
+      ].join('\n'),
       start: { dateTime: plan.start, ...zone },
       end: {
         dateTime: plan.end,

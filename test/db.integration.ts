@@ -126,23 +126,54 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
     };
     await store.saveMail(scope, mail);
     await t.test(
-      'inference cache checks model identity and revalidates without running inference',
+      'cached mail skips inference and uncached mail is batched, retried if missing, and saved',
       async (t) => {
         const digest = 'a'.repeat(64);
-        t.mock.method(globalThis, 'fetch', async (input: string | URL | Request) => {
-          const path = String(input);
-          if (path.endsWith('/api/tags'))
-            return Response.json({ models: [{ name: 'test-model', model: 'test-model', digest }] });
-          if (path.endsWith('/api/show')) return Response.json({ details: { format: 'gguf' } });
-          throw new Error('保存済み抽出に対して推論を呼び出してはいけません');
-        });
+        const calls: string[][] = [];
         const extraction: Extraction = {
           intent: 'not_event',
           reason: '予定ではない',
           evidence: '',
           events: [],
         };
-        const key = extractionCacheKey(mail, 'test-model', digest);
+        t.mock.method(
+          globalThis,
+          'fetch',
+          async (input: string | URL | Request, init?: RequestInit) => {
+            const path = String(input);
+            if (path.endsWith('/api/tags'))
+              return Response.json({
+                models: [{ name: 'test-model', model: 'test-model', digest }],
+              });
+            if (path.endsWith('/api/show')) return Response.json({ details: { format: 'gguf' } });
+            assert.ok(path.endsWith('/api/chat'));
+            const request = JSON.parse(String(init?.body));
+            const payload = JSON.parse(request.messages.at(-1).content);
+            const subjects: string[] = payload.mails?.map(
+              (m: { subject: string }) => m.subject,
+            ) ?? [payload.subject];
+            calls.push(subjects);
+            const reply = payload.mails
+              ? {
+                  results: [
+                    { id: 3, extraction: { ...extraction, reason: 'third' } },
+                    { id: 1, extraction: { ...extraction, reason: 'first' } },
+                  ],
+                }
+              : { ...extraction, reason: 'retry' };
+            return new Response(
+              JSON.stringify({ message: { content: JSON.stringify(reply) }, done: true }) + '\n',
+            );
+          },
+        );
+        const messages = ['cached', 'first', 'missing', 'third'].map((label, i) => ({
+          ...mail,
+          source: undefined,
+          uid: i + 1,
+          subject: '面接日程が確定 ' + label,
+          text: '日時：2026年11月20日 15:00 JST',
+        }));
+        const key = extractionCacheKey(messages[0]!, 'test-model', digest);
         await store.saveExtraction(key, 'test-model', extraction);
         const collection: Collection = {
           version: 1,
@@ -150,22 +181,37 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
           uidValidity: '1',
           since: since.toISOString(),
           collectedAt: new Date().toISOString(),
-          matched: 1,
+          matched: messages.length,
           complete: true,
-          messages: [mail],
+          messages,
           errors: [],
           sourceScope: scope,
         };
-        const report = await writeDryRun(
-          collection,
-          directory,
-          undefined,
-          new Date('2026-11-17T00:00:00Z'),
-          'test-model',
-          store,
-        );
+        const run = () =>
+          writeDryRun(
+            collection,
+            directory,
+            undefined,
+            new Date('2026-11-17T00:00:00Z'),
+            'test-model',
+            store,
+          );
+        const report = await run();
         assert.equal(report.complete, true);
-        assert.notEqual(extractionCacheKey(mail, 'test-model', 'b'.repeat(64)), key);
+        assert.equal(report.llm.cacheHits, 1);
+        assert.equal(report.llm.batchRequests, 1);
+        assert.equal(report.llm.requests, 2);
+        assert.deepEqual(calls, [messages.slice(1).map((m) => m.subject), [messages[2]!.subject]]);
+        assert.deepEqual(
+          report.messages.slice(1).map((m) => m.reasons[0]),
+          ['ローカルLLM: first', 'ローカルLLM: retry', 'ローカルLLM: third'],
+        );
+        const repeat = await run();
+        assert.equal(repeat.complete, true);
+        assert.equal(repeat.llm.cacheHits, 4);
+        assert.equal(repeat.llm.requests, 0);
+        assert.equal(calls.length, 2);
+        assert.notEqual(extractionCacheKey(messages[0]!, 'test-model', 'b'.repeat(64)), key);
         assert.equal((await store.cachedMails(scope)).size, 2);
       },
     );
@@ -217,7 +263,9 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
           collectedAt: new Date().toISOString(),
           matched: 1,
           complete: true,
-          messages: [mail],
+          messages: [
+            { ...mail, subject: '面接日程が確定', text: '日時：2026年11月20日 15:00 JST' },
+          ],
           errors: [],
           sourceScope: scope,
         };

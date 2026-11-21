@@ -52,7 +52,7 @@ export function createIcs(events: SelectedEvent[], now = new Date()) {
         ? `DTSTART;VALUE=DATE:${event.payload.allDayDate.replaceAll('-', '')}`
         : `DTSTART:${stamp(new Date(event.payload.start.dateTime))}`,
       event.payload.allDayDate
-        ? `DTEND;VALUE=DATE:${DateTime.fromISO(event.payload.allDayDate).plus({ days: 1 }).toISODate()!.replaceAll('-', '')}`
+        ? `DTEND;VALUE=DATE:${DateTime.fromISO(event.payload.end.dateTime, { setZone: true }).toISODate()!.replaceAll('-', '')}`
         : `DTEND:${stamp(new Date(event.payload.end.dateTime))}`,
       `SUMMARY:${escapeIcsText(event.payload.summary)}`,
       `LOCATION:${escapeIcsText(event.payload.location)}`,

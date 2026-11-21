@@ -61,8 +61,9 @@ export async function collectSource(
   const save = () =>
     writeFile(`${directory}/mail-cache.json`, JSON.stringify(result, null, 2), { mode: 0o600 });
   await save();
+  const reused = index.filter((header) => cached.has(header.source.messageId)).length;
   console.error(
-    `対象メール: ${index.length}件（${reader.source.name}）。取得済み本文を再利用します。`,
+    `対象メール: ${index.length}件（${reader.source.name}） / 本文再利用: ${reused}件 / 未取得: ${index.length - reused}件`,
   );
   for (let i = 0; i < index.length; i += 5) {
     const batch = index.slice(i, i + 5);
@@ -103,7 +104,7 @@ export async function collectSource(
       }
     }
     if ((i + 5) % 25 === 0 || i + 5 >= index.length) {
-      await save();
+      if (!store) await save();
       console.error(
         `取得: ${Math.min(i + 5, index.length)}/${index.length}件（${reader.source.name}）`,
       );

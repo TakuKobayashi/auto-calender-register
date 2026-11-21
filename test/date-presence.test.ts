@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import type { CollectedMail, Collection } from '../src/collect.js';
 import { inspectDatePresence } from '../src/date-presence.js';
 import { writeDryRun } from '../src/dry-run.js';
+import { shortlistReason } from '../src/mail-shortlist.js';
 
 function mail(text: string, overrides: Partial<CollectedMail> = {}): CollectedMail {
   return {
@@ -101,13 +102,30 @@ for (const text of [
   'Your booking was cancelled.',
   'Your documents have been submitted.',
 ]) {
-  test(`日付のない後続通知を残す: ${text}`, () => {
+  test(`後続通知の種類で日付の有無は変わらない: ${text}`, () => {
     const result = inspectDatePresence(mail(text));
     assert.equal(result.hasDate, false);
-    assert.equal(result.needsLifecycleCheck, true);
   });
 }
-test('日付なしと日付だけの広告はいずれもモデルを呼ばない', async (t) => {
+test('事前選別は用途を問わず、具体的な未来の日付や相対日付とICSを残す', () => {
+  const time = new Date('2026-11-21T08:28:00Z');
+  for (const text of [
+    '11月25日に検体の保管場所が切り替わります。',
+    '2026年11月25日から全品セール。',
+    '来週火曜に古い鍵を使えなくなります。',
+    'within three business days',
+  ]) {
+    assert.ok(shortlistReason(mail(text), time), text);
+  }
+  assert.equal(shortlistReason(mail('対象月：2026年12月'), time), undefined);
+  assert.equal(shortlistReason(mail('明日'), time), undefined);
+  const event = mail('添付をご覧ください。', {
+    calendarParts: ['BEGIN:VCALENDAR\r\nDTSTART;VALUE=DATE:20261125\r\nEND:VCALENDAR'],
+  });
+  assert.ok(shortlistReason(event, time));
+});
+
+test('日付なしと過去の日付だけのメールはいずれもモデルを呼ばない', async (t) => {
   t.mock.method(globalThis, 'fetch', async () => {
     throw new Error('Ollamaを呼んではいけません');
   });
@@ -122,7 +140,7 @@ test('日付なしと日付だけの広告はいずれもモデルを呼ばな�
     complete: true,
     messages: [
       mail('おすすめの新商品です'),
-      mail('2026年11月25日 12:00から数量限定セールを開催します。', { uid: 2 }),
+      mail('2026年11月15日 12:00に行われました。', { uid: 2 }),
     ],
     errors: [],
   };
@@ -138,12 +156,14 @@ test('日付なしと日付だけの広告はいずれもモデルを呼ばな�
   assert.equal(report.messages[0]!.decision, 'excluded');
   assert.match(report.messages[0]!.reasons.join(' '), /日付情報なし/);
   assert.equal(report.messages[1]!.shouldRegister, false);
-  assert.match(report.messages[1]!.reasons.join(' '), /手掛かりが揃わない/);
+  assert.match(report.messages[1]!.reasons.join(' '), /今後の日時候補を確認できない/);
   assert.deepEqual(report.llm, {
     skippedNoDate: 1,
     skippedByShortlist: 1,
     cacheHits: 0,
     requests: 0,
+    batchRequests: 0,
+    uncachedMails: 0,
   });
 });
 

@@ -106,7 +106,7 @@ export class GoogleCalendar implements CalendarPort {
       ? {
           ...payload,
           start: { date: allDayDate },
-          end: { date: DateTime.fromISO(allDayDate).plus({ days: 1 }).toISODate()! },
+          end: { date: DateTime.fromISO(payload.end.dateTime, { setZone: true }).toISODate()! },
         }
       : payload;
     return this.request<GoogleEvent>('POST', this.url, { sendUpdates: 'none' }, data);

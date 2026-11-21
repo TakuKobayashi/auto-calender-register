@@ -157,9 +157,24 @@ test('pendingからconfirmedの通知が来たときだけ候補にできる', (
 });
 
 test('予定日時・会場・確定の引用が正しければ登録用payloadを生成', () => {
-  const result = extractionToPlan(mail(), extraction(), now, finalize);
+  const original = mail();
+  const modelResult = extraction();
+  modelResult.events[0]!.calendarDetails = [
+    '受付で身分証を提示してください。',
+    '朝食は無料です。',
+    '受取コード：123456',
+  ];
+  const result = extractionToPlan(
+    { ...original, text: original.text + '\n受付で身分証を提示してください。\n受取コード：123456' },
+    validateExtraction(modelResult),
+    now,
+    finalize,
+  );
   assert.equal(result.events[0]?.payload?.start.dateTime, '2026-11-20T15:00:00.000+09:00');
   assert.equal(result.events[0]?.payload?.end.dateTime, '2026-11-21T10:00:00.000+09:00');
+  const description = result.events[0]!.payload!.description;
+  assert.ok(description.startsWith('受付で身分証を提示してください。'));
+  assert.doesNotMatch(description, /朝食は無料|123456/);
 });
 
 test('モデルが日付を捏造しても原文との照合で保留', () => {

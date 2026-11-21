@@ -98,11 +98,14 @@ export function validateSelection(raw: unknown, now = new Date()): Selection {
     if (end <= start) throw new Error('終了日時が開始日時以前です。');
     if (payload.allDayDate) {
       const day = DateTime.fromISO(payload.allDayDate, { zone: payload.start.timeZone ?? 'UTC' });
+      const last = end.setZone(day.zone);
       if (
         !/^\d{4}-\d{2}-\d{2}$/.test(payload.allDayDate) ||
         !day.isValid ||
         day.toMillis() !== start.toMillis() ||
-        day.plus({ days: 1 }).toMillis() !== end.toMillis()
+        last.toMillis() !== last.startOf('day').toMillis() ||
+        last.toISODate() !== end.toISODate() ||
+        last < day.plus({ days: 1 })
       )
         throw new Error('終日予定の日付と開始・終了が一致しません。');
     }

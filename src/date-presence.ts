@@ -4,7 +4,6 @@ import { modelText, unwrapForward } from './ollama.js';
 
 export type DatePresence = {
   hasDate: boolean;
-  needsLifecycleCheck: boolean;
   reason: string;
 };
 
@@ -25,19 +24,15 @@ const dateHints: RegExp[] = [
   /\b(?:end|beginning|middle)\s+of\s+(?:(?:the|this|next)\s+)?(?:day|week|month|year)\b|\b\d{1,2}(?:st|nd|rd|th)\b/i,
 ];
 
-const lifecycleHint =
-  /取消|取り消|キャンセル|中止|延期|変更|振替|完了|(?:受取|受取り|受け取り|受領|提出|返却|支払|支払い|手続|手続き|対応|処理)(?:済|済み)|\b(?:cancel(?:led|ed|lation)?|reschedul(?:e|ed|ing)|postpon(?:e|ed|ement)|completed|collected|picked\s+up|returned|submitted|paid|fulfilled)\b/iu;
-
 export function inspectDatePresence(mail: CollectedMail): DatePresence {
   // Do not count transport timestamps, URLs, or dates in old quoted replies.
   const subject = unwrapForward(mail).subject.replace(/https?:\/\/\S+/gi, '');
   const body = modelText(mail);
   const text = `${subject}\n${body}`.normalize('NFKC');
-  const needsLifecycleCheck = lifecycleHint.test(text);
   if (mail.calendarParts.some((part) => /BEGIN:VCALENDAR/i.test(part)))
-    return { hasDate: true, needsLifecycleCheck, reason: 'ICS情報あり' };
+    return { hasDate: true, reason: 'ICS情報あり' };
   if (dateHints.some((pattern) => pattern.test(text)))
-    return { hasDate: true, needsLifecycleCheck, reason: '日付・曜日・相対日付・期限表現あり' };
+    return { hasDate: true, reason: '日付・曜日・相対日付・期限表現あり' };
 
   const reference = new Date(mail.date ?? mail.receivedAt ?? '2000-01-01T00:00:00Z');
   // Bound parser inputs, but scan every chunk, including the end of long mail.
@@ -53,13 +48,7 @@ export function inspectDatePresence(mail: CollectedMail): DatePresence {
             ),
           )
       )
-        return { hasDate: true, needsLifecycleCheck, reason: '日付パーサーで日付表現を検出' };
+        return { hasDate: true, reason: '日付パーサーで日付表現を検出' };
   }
-  return {
-    hasDate: false,
-    needsLifecycleCheck,
-    reason: needsLifecycleCheck
-      ? '日付なし・取消や完了などの後続通知を確認'
-      : '件名・本文・ICSに日付情報なし',
-  };
+  return { hasDate: false, reason: '件名・本文・ICSに日付情報なし' };
 }

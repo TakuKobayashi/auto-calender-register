@@ -37,18 +37,27 @@ export function checkedModelText(mail: CollectedMail) {
   return text;
 }
 
-// Include the actual prompt/schema and full input, so changes invalidate saved inference.
+// Version the extraction contract and input. Optional calendar copy can be
+// absent in cached entries and does not invalidate completed extractions.
 export function extractionCacheKey(mail: CollectedMail, model: string, modelDigest: string) {
-  const normalized = unwrapForward(mail);
-  const input = {
-    subject: normalized.subject,
-    sentAt: normalized.date,
-    receivedAt: mail.receivedAt,
-    body: modelText(mail),
-  };
+  const input = modelInput(mail, modelText(mail));
   return createHash('sha256')
     .update(JSON.stringify({ instructions, extractionSchema, input, model, modelDigest }))
     .digest('hex');
+}
+
+function modelInput(mail: CollectedMail, body: string) {
+  const normalized = unwrapForward(mail);
+  return {
+    subject: normalized.subject,
+    sentAt: normalized.date,
+    receivedAt: mail.receivedAt,
+    body,
+  };
+}
+
+export function extractionInputBytes(mail: CollectedMail, body: string) {
+  return Buffer.byteLength(JSON.stringify(modelInput(mail, body)));
 }
 
 export type Intent =
@@ -61,6 +70,8 @@ export type Extraction = {
   events: {
     kind?: 'appointment' | 'deadline';
     title: string;
+    calendarDetails?: string[];
+    startBasis?: 'text' | 'notification';
     startLocal: string | null;
     endLocal: string | null;
     startZone: string | null;
@@ -223,6 +234,34 @@ startZone/endZoneは実際の会場・都市・国・空港、または明示さ
 startEvidence/endEvidence/zoneEvidence/confirmationEvidence/evidenceは本文に実在する短い連続した引用。離れた行を結合せず、言い換えず、開始の引用には年月日と時刻のある行を優先します。zoneEvidenceに推定したIANA名を書かず、本文の場所または時差を引用します。reasonは短い説明にします。
 referencesには本文の予約・注文・受付・配送・手続き等を一意に対応付ける番号だけを原文のまま返します。推測しません。広告や署名の一般的な会員番号は使いません。複数の独立した予定は別イベントにします。本人の確定した用事がなければeventsは空配列です。`;
 
+const calendarInstructions =
+  '\nカレンダーのtitleは、何の予定かが一覧で分かる短い文にします。対応期限は「何をするか」が分かる行動名にします。calendarDetailsには、当日必要になる情報（集合・受付、持ち物、何をどこで行うか、手続きなど）を示す本文の短い連続引用を最大3件返します。同じ文は繰り返さず、裏付けがなければ空配列にします。認証コード、アクセス用リンク、個人識別番号、注文番号などはtitleやcalendarDetailsへ転記しません。';
+const periodInstructions =
+  '\n利用可能期間や受付期間の判定では、まずこのメールが利用開始を知らせる初回通知かを、件名と本文の両方で確かめます。開始通知で、本文に明示の開始日がない場合は startBasis="notification"、startLocal=null、endLocal=本文の最終日とします。例えば利用の準備が整ったことと、利用可能な最終日が通知された場合です。startEvidenceには利用可能と分かる本文の原文を、endEvidenceには最終日を含む原文を引用します。開始日の記載がある場合やリマインダーでは startBasis="text" とし、リマインダーの送信日を開始日にしません。時刻の記載がない日はYYYY-MM-DDを返し、00:00や23:59を補いません。最終日は当日を含みます。zoneEvidenceには実在する地名や時差の原文を引用してください。';
+const calendarEventSchema = extractionSchema.properties.events.items;
+const calendarExtractionSchema = {
+  ...extractionSchema,
+  properties: {
+    ...extractionSchema.properties,
+    events: {
+      ...extractionSchema.properties.events,
+      items: {
+        ...calendarEventSchema,
+        properties: {
+          ...calendarEventSchema.properties,
+          startBasis: { type: 'string', enum: ['text', 'notification'] },
+          calendarDetails: {
+            type: 'array',
+            maxItems: 3,
+            items: { type: 'string', maxLength: 180 },
+          },
+        },
+        required: [...calendarEventSchema.required, 'calendarDetails', 'startBasis'],
+      },
+    },
+  },
+};
+
 export function validateExtraction(value: unknown): Extraction {
   if (!value || typeof value !== 'object')
     throw new OllamaError('LLM出力がオブジェクトではありません。');
@@ -254,6 +293,15 @@ export function validateExtraction(value: unknown): Extraction {
     if (!event || typeof event !== 'object') throw new OllamaError('予定形式不正');
     if (event.kind !== undefined && !['appointment', 'deadline'].includes(event.kind))
       throw new OllamaError('予定種別が不正');
+    if (event.startBasis !== undefined && !['text', 'notification'].includes(event.startBasis))
+      throw new OllamaError('予定の開始根拠が不正');
+    if (
+      event.calendarDetails !== undefined &&
+      (!Array.isArray(event.calendarDetails) ||
+        event.calendarDetails.length > 3 ||
+        event.calendarDetails.some((detail) => typeof detail !== 'string' || detail.length > 180))
+    )
+      throw new OllamaError('カレンダー説明の形式不正');
     for (const key of [
       'title',
       'location',
@@ -277,12 +325,98 @@ export async function extractWithOllama(
   model: string,
   timeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS ?? 600_000),
 ): Promise<Extraction> {
+  const input = modelInput(mail, checkedModelText(mail));
+  return validateExtraction(
+    await requestExtraction(
+      model,
+      instructions + calendarInstructions + periodInstructions,
+      calendarExtractionSchema,
+      input,
+      2000,
+      timeoutMs,
+    ),
+  );
+}
+
+export async function extractBatchWithOllama(
+  mails: CollectedMail[],
+  model: string,
+): Promise<(Extraction | undefined)[]> {
+  const input = mails.map((mail, index) => ({
+    id: index + 1,
+    ...modelInput(mail, checkedModelText(mail)),
+  }));
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['results'],
+    properties: {
+      results: {
+        type: 'array',
+        minItems: mails.length,
+        maxItems: mails.length,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['id', 'extraction'],
+          properties: {
+            id: { type: 'integer', minimum: 1, maximum: mails.length },
+            extraction: calendarExtractionSchema,
+          },
+        },
+      },
+    },
+  };
+  let value: unknown;
+  try {
+    value = await requestExtraction(
+      model,
+      instructions +
+        calendarInstructions +
+        periodInstructions +
+        '\n複数のメールを独立して判定します。入力の各idに対して1件のresultsをidとextractionで返してください。別のメールから根拠や日時を引用しないでください。',
+      schema,
+      { mails: input },
+      2000 * mails.length,
+    );
+  } catch (error) {
+    // Retry individual messages only for unusable output, not connection failures.
+    if (!(error instanceof SyntaxError || (error instanceof OllamaError && error.needsReview)))
+      throw error;
+  }
+  const results = (value as { results?: unknown } | undefined)?.results;
+  const extractions: (Extraction | undefined)[] = Array.from({ length: mails.length });
+  const seen = new Set<number>();
+  if (!Array.isArray(results)) return extractions;
+  for (const result of results) {
+    const id: number = result?.id;
+    if (!Number.isInteger(id) || id < 1 || id > mails.length) continue;
+    if (seen.has(id)) {
+      extractions[id - 1] = undefined;
+      continue;
+    }
+    seen.add(id);
+    try {
+      extractions[id - 1] = validateExtraction(result.extraction);
+    } catch (error) {
+      if (!(error instanceof OllamaError)) throw error;
+    }
+  }
+  return extractions;
+}
+
+async function requestExtraction(
+  model: string,
+  prompt: string,
+  schema: object,
+  input: unknown,
+  outputTokens: number,
+  timeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS ?? 600_000),
+): Promise<unknown> {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 1800_000)
     throw new OllamaError('OLLAMA_TIMEOUT_MSは1000〜1800000の整数で指定してください。');
   // アカウント本文を外部ホストに送らないよう接続先はループバック固定。
-  const text = checkedModelText(mail);
   await localModelDigest(model);
-  const unwrapped = unwrapForward(mail);
   const response = await fetch('http://127.0.0.1:11434/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -291,31 +425,23 @@ export async function extractWithOllama(
       model,
       stream: true,
       think: false,
-      format: extractionSchema,
+      format: schema,
       options: {
         temperature: 0,
         seed: 42,
         presence_penalty: 0,
         repeat_penalty: 1,
         num_ctx: 12288,
-        num_predict: 2000,
+        num_predict: outputTokens,
       },
       messages: [
-        { role: 'system', content: instructions },
-        {
-          role: 'user',
-          content: JSON.stringify({
-            subject: unwrapped.subject,
-            sentAt: unwrapped.date,
-            receivedAt: mail.receivedAt,
-            body: text,
-          }),
-        },
+        { role: 'system', content: prompt },
+        { role: 'user', content: JSON.stringify(input) },
       ],
     }),
   });
   if (!response.ok) throw new OllamaError(`Ollama応答エラー: HTTP ${response.status}`);
-  return validateExtraction(JSON.parse(await readOllamaChat(response)));
+  return JSON.parse(await readOllamaChat(response));
 }
 
 export async function readOllamaChat(response: Response): Promise<string> {
@@ -524,19 +650,36 @@ export function extractionToPlan(
       )
         ? e.startLocal.slice(0, 10)
         : e.startLocal;
-    const start = parse(effectiveStart, e.startZone);
-    const allDay = effectiveStart?.length === 10;
+    const reference = new Date(mail.date ?? mail.receivedAt ?? now);
+    const notificationStart =
+      e.startBasis === 'notification' &&
+      e.kind === 'deadline' &&
+      e.startLocal === null &&
+      e.endLocal?.length === 10 &&
+      e.startZone &&
+      quoteExists(text, startEvidence) &&
+      zoneSupported(e.startZone, zoneEvidence)
+        ? DateTime.fromJSDate(new Date(mail.date ?? mail.receivedAt ?? ''), {
+            zone: e.startZone,
+          }).startOf('day')
+        : null;
+    const start =
+      e.startBasis === 'notification' ? notificationStart : parse(effectiveStart, e.startZone);
+    const allDay = Boolean(notificationStart) || effectiveStart?.length === 10;
+    const endInText = e.endLocal ? parse(e.endLocal, e.endZone ?? e.startZone) : null;
     const end = e.endLocal
-      ? parse(e.endLocal, e.endZone ?? e.startZone)
+      ? allDay && e.endLocal.length === 10
+        ? (endInText?.plus({ days: 1 }) ?? null)
+        : endInText
       : (start?.plus(allDay ? { days: 1 } : { minutes: 15 }) ?? null);
+    if (notificationStart?.isValid) reasons.push('開始通知の日から本文の最終日までを終日表示');
     if (!e.endLocal)
       reasons.push(
         allDay
           ? '時刻未記載のため終日表示'
           : '終了時刻未記載。15分枠は開始通知用で実際の所要時間ではありません',
       );
-    const reference = new Date(mail.date ?? mail.receivedAt ?? now);
-    if (!dateSupported(effectiveStart, startEvidence, reference)) {
+    if (!notificationStart?.isValid && !dateSupported(effectiveStart, startEvidence, reference)) {
       eligible = false;
       reasons.push('開始の年月日・時刻が引用した原文と一致しない');
     }
@@ -550,7 +693,7 @@ export function extractionToPlan(
       eligible = false;
       reasons.push('終了の年月日・時刻または所要時間を原文から検証できない');
     }
-    if (!start) {
+    if (!start?.isValid) {
       eligible = false;
       reasons.push('開始日時・タイムゾーンを確定できない');
     }
@@ -566,9 +709,20 @@ export function extractionToPlan(
       eligible = false;
       reasons.push('予定の場所を原文で確認できない');
     }
+    const calendarDetails = [
+      ...new Set((e.calendarDetails ?? []).map((detail) => detail.trim())),
+    ].filter(
+      (detail) =>
+        quoteExists(text, detail) &&
+        !/https?:\/\/|\[URL\]|認証コード|受取コード|受け取りコード|暗証番号|パスワード|注文番号|QRコード|\b(?:PIN|passcode|password|access code)\b/i.test(
+          detail.normalize('NFKC'),
+        ) &&
+        !(extraction.references ?? []).some((ref) => ref && detail.includes(ref)),
+    );
     const plan = finalize(
       {
         title: e.title,
+        calendarDetails,
         kind: e.kind ?? 'appointment',
         ...(base.bookingIds?.length && start
           ? {
@@ -579,7 +733,7 @@ export function extractionToPlan(
               ]),
             }
           : {}),
-        ...(allDay && start ? { allDayDate: start.toISODate()! } : {}),
+        ...(allDay && start?.isValid ? { allDayDate: start.toISODate()! } : {}),
         start: start?.toISO() ?? null,
         end: end?.toISO() ?? null,
         localStart: e.startLocal ?? undefined,

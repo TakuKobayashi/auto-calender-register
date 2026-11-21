@@ -4,6 +4,7 @@ import { extractionToPlan, type Extraction } from '../src/ollama.js';
 import { finalize } from '../src/classify.js';
 import type { CollectedMail } from '../src/domain/mail.js';
 import { createIcs } from '../src/ics.js';
+import { validateSelection } from '../src/selection.js';
 
 const now = new Date('2026-11-14T00:00:00Z');
 function example(label: string, intent: Extraction['intent'] = 'confirmed') {
@@ -90,4 +91,36 @@ test('時刻のない期限にモデルが補った00:00は本文を検証して
   extraction.events[0]!.startLocal = '2026-11-20T00:00:00';
   const result = extractionToPlan(mail, extraction, now, finalize);
   assert.equal(result.events[0]?.payload?.allDayDate, '2026-11-20');
+});
+
+test('本文に開始日がない利用期間は、原文の開始根拠と通知日から終日予定にする', () => {
+  const { mail, extraction } = example('資料を閲覧する');
+  const startEvidence = '本通知をもって資料の閲覧が可能になりました。';
+  mail.text += '\n' + startEvidence;
+  Object.assign(extraction.events[0]!, {
+    startBasis: 'notification',
+    startLocal: null,
+    startEvidence,
+    endLocal: '2026-11-20',
+    endEvidence: '期限：2026年11月20日',
+  });
+  const plan = extractionToPlan(mail, extraction, now, finalize);
+  const event = plan.events[0]!;
+  assert.equal(plan.decision, 'candidate');
+  const selection = validateSelection(
+    {
+      schemaVersion: 1,
+      complete: true,
+      mode: 'dry-run',
+      executedAt: now.toISOString(),
+      messages: [plan],
+      proposed: [{ sourceUid: mail.uid, eventKey: event.eventKey, payload: event.payload }],
+    },
+    now,
+  );
+  const ics = createIcs(selection.events, now);
+  assert.match(ics, /DTSTART;VALUE=DATE:20261114/);
+  assert.match(ics, /DTEND;VALUE=DATE:20261121/);
+  extraction.events[0]!.startEvidence = '原文にない開始根拠';
+  assert.equal(extractionToPlan(mail, extraction, now, finalize).decision, 'review');
 });
