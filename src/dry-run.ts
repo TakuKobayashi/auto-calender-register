@@ -23,6 +23,7 @@ import { finalize } from './classify.js';
 import { mailLabel, sourceScope } from './domain/mail.js';
 import { inspectDatePresence } from './date-presence.js';
 import { shortlistReason } from './mail-shortlist.js';
+import { optionalMailExclusion } from './mail-exclusions.js';
 import type { CollectedMail } from './domain/mail.js';
 
 type ExistingEvent = {
@@ -109,6 +110,7 @@ export async function writeDryRun(
   const llm = {
     skippedNoDate: 0,
     skippedByShortlist: 0,
+    skippedOptionalMail: 0,
     cacheHits: 0,
     requests: 0,
     batchRequests: 0,
@@ -177,6 +179,19 @@ export async function writeDryRun(
       const plan = initial[i]!;
       let key: string | undefined;
       try {
+        const exclusion = optionalMailExclusion(mail);
+        if (exclusion) {
+          llm.skippedOptionalMail++;
+          const reason = `${exclusion}。LLM判定を省略`;
+          overrides.set(mail.uid, {
+            ...plan,
+            decision: 'excluded',
+            events: [],
+            reasons: [...plan.reasons, reason],
+          });
+          console.error(`登録しない: ${mailLabel(mail)} ｜ ${reason}`);
+          continue;
+        }
         const shortlist = shortlistReason(mail, now);
         if (!shortlist) {
           const presence = inspectDatePresence(mail);
@@ -306,7 +321,7 @@ export async function writeDryRun(
     `既存カレンダー照合: ${existingFile ? 'ローカルスナップショットのみ（最新性は未保証）' : '未接続・未確認。候補は登録確定ではありません。'}`,
     '',
     `確認メール ${plans.length}件 / 登録候補 ${proposed.length}件 / 登録しない ${plans.filter((p) => !p.shouldRegister).length}件 / 処理エラー ${counts.error}件`,
-    `新規LLM判定 ${llm.uncachedMails}通 / LLM呼び出し ${llm.requests}回（うち一括 ${llm.batchRequests}回） / キャッシュ利用 ${llm.cacheHits}通 / 日付なしで省略 ${llm.skippedNoDate}件 / 今後の日時候補なしで省略 ${llm.skippedByShortlist}件`,
+    `新規LLM判定 ${llm.uncachedMails}通 / LLM呼び出し ${llm.requests}回（うち一括 ${llm.batchRequests}回） / キャッシュ利用 ${llm.cacheHits}通 / 販促・一般案内等で省略 ${llm.skippedOptionalMail}件 / 日付なしで省略 ${llm.skippedNoDate}件 / 今後の日時候補なしで省略 ${llm.skippedByShortlist}件`,
     '',
     '## 登録候補',
     '',

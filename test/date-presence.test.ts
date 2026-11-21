@@ -7,6 +7,7 @@ import type { CollectedMail, Collection } from '../src/collect.js';
 import { inspectDatePresence } from '../src/date-presence.js';
 import { writeDryRun } from '../src/dry-run.js';
 import { shortlistReason } from '../src/mail-shortlist.js';
+import { optionalMailExclusion } from '../src/mail-exclusions.js';
 
 function mail(text: string, overrides: Partial<CollectedMail> = {}): CollectedMail {
   return {
@@ -148,7 +149,21 @@ test('事前選別は定型フッターだけの日付を省略し、本文・�
   );
 });
 
-test('日付なしと過去の日付だけのメールはいずれもモデルを呼ばない', async (t) => {
+test('販促語があっても既存の注文やICSがあれば除外しない', () => {
+  const subject = 'キャンペーンのご案内';
+  const body = '11月25日まで。配信停止は設定から行えます。';
+  assert.ok(optionalMailExclusion(mail(body, { subject })));
+  assert.equal(
+    optionalMailExclusion(mail('注文番号：TEST123456\n' + body, { subject })),
+    undefined,
+  );
+  assert.equal(
+    optionalMailExclusion(mail(body, { subject, calendarParts: ['BEGIN:VCALENDAR'] })),
+    undefined,
+  );
+});
+
+test('日時候補がないメールや販促メールはモデルを呼ばない', async (t) => {
   t.mock.method(globalThis, 'fetch', async () => {
     throw new Error('Ollamaを呼んではいけません');
   });
@@ -159,11 +174,15 @@ test('日付なしと過去の日付だけのメールはいずれもモデル�
     uidValidity: '1',
     since: '2026-10-01T00:00:00Z',
     collectedAt: '2026-11-18T00:00:00Z',
-    matched: 2,
+    matched: 3,
     complete: true,
     messages: [
       mail('おすすめの新商品です'),
       mail('2026年11月15日 12:00に行われました。', { uid: 2 }),
+      mail('11月25日まで全品割引。配信停止は設定から行えます。', {
+        uid: 3,
+        subject: '期間限定セール',
+      }),
     ],
     errors: [],
   };
@@ -180,9 +199,12 @@ test('日付なしと過去の日付だけのメールはいずれもモデル�
   assert.match(report.messages[0]!.reasons.join(' '), /日付情報なし/);
   assert.equal(report.messages[1]!.shouldRegister, false);
   assert.match(report.messages[1]!.reasons.join(' '), /今後の日時候補を確認できない/);
+  assert.equal(report.messages[2]!.shouldRegister, false);
+  assert.match(report.messages[2]!.reasons.join(' '), /販促案内/);
   assert.deepEqual(report.llm, {
     skippedNoDate: 1,
     skippedByShortlist: 1,
+    skippedOptionalMail: 1,
     cacheHits: 0,
     requests: 0,
     batchRequests: 0,
