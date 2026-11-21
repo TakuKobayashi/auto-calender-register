@@ -23,7 +23,7 @@ import { finalize } from './classify.js';
 import { mailLabel, sourceScope } from './domain/mail.js';
 import { inspectDatePresence } from './date-presence.js';
 import { shortlistReason } from './mail-shortlist.js';
-import { optionalMailExclusion } from './mail-exclusions.js';
+import { filterCalendarMails } from './mail-exclusions.js';
 import type { CollectedMail } from './domain/mail.js';
 
 type ExistingEvent = {
@@ -118,6 +118,10 @@ export async function writeDryRun(
   };
   if (model) {
     const initial = classifyAll(collection.messages, now);
+    const filterErrors = new Map<CollectedMail, unknown>();
+    const candidates = new Set(
+      filterCalendarMails(collection.messages, (mail, error) => filterErrors.set(mail, error)),
+    );
     type Pending = { mail: CollectedMail; plan: MailPlan; key: string; bytes: number };
     const pending: Pending[] = [];
     const applyExtraction = (mail: CollectedMail, plan: MailPlan, extraction: Extraction) => {
@@ -179,17 +183,16 @@ export async function writeDryRun(
       const plan = initial[i]!;
       let key: string | undefined;
       try {
-        const exclusion = optionalMailExclusion(mail);
-        if (exclusion) {
+        if (filterErrors.has(mail)) throw filterErrors.get(mail);
+        if (!candidates.has(mail)) {
           llm.skippedOptionalMail++;
-          const reason = `${exclusion}。LLM判定を省略`;
           overrides.set(mail.uid, {
             ...plan,
             decision: 'excluded',
             events: [],
-            reasons: [...plan.reasons, reason],
+            reasons: [],
           });
-          console.error(`登録しない: ${mailLabel(mail)} ｜ ${reason}`);
+          console.error(`登録しない: ${mailLabel(mail)}`);
           continue;
         }
         const shortlist = shortlistReason(mail, now);
