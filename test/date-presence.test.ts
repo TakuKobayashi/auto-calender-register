@@ -125,6 +125,29 @@ test('事前選別は用途を問わず、具体的な未来の日付や相対�
   assert.ok(shortlistReason(event, time));
 });
 
+test('事前選別は定型フッターだけの日付を省略し、本文・件名・紛らわしい行の日付を残す', () => {
+  const time = new Date('2026-11-21T08:28:00Z');
+  const body =
+    'ご利用ありがとうございます。\nこのメールは定期のお知らせです。\n配信停止: https://example.test/stop\nサービス移行日: 2026年11月25日';
+  assert.equal(shortlistReason(mail(body), time), undefined);
+  assert.ok(shortlistReason(mail(body, { subject: '11月25日のお知らせ' }), time));
+  assert.ok(shortlistReason(mail('11月25日にお越しください。\n' + body), time));
+  assert.ok(
+    shortlistReason(
+      mail(
+        body.replace(
+          '配信停止: https://example.test/stop',
+          '配信停止については担当者にご連絡ください。',
+        ),
+      ),
+      time,
+    ),
+  );
+  assert.ok(
+    shortlistReason(mail(body.replace('配信停止:', '11月25日までに配信停止する場合:')), time),
+  );
+});
+
 test('日付なしと過去の日付だけのメールはいずれもモデルを呼ばない', async (t) => {
   t.mock.method(globalThis, 'fetch', async () => {
     throw new Error('Ollamaを呼んではいけません');

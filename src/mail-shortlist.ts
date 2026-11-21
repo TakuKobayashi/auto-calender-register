@@ -9,6 +9,24 @@ const relativeMonthEnd = /(?:今|来|再来)月末|月末|\bend of (?:this|next|
 const businessDayOffset =
   /\b(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:business|working)\s+days?\b|(\d{1,2})\s*営業日\s*(?:以内|後|まで)/gi;
 const numberWords = ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'];
+const unsubscribe = /配信停止|配信解除|登録解除|\bunsubscribe\b/i;
+const footerHeading =
+  /^[【［[\s■◆●※*#]*(?:配信停止|配信解除|登録解除|unsubscribe)(?:について|のご案内)?[】］\]\s:：]*$/i;
+
+function bodyBeforeFooter(body: string) {
+  const lines = body.split('\n');
+  const tail = Math.max(1, Math.floor(lines.length * 0.6));
+  const boundary = lines.findIndex(
+    (line, index) =>
+      index >= tail &&
+      (/^--\s*$/.test(line) ||
+        footerHeading.test(line) ||
+        (unsubscribe.test(line) && line.includes('[URL]'))),
+  );
+  // Keep the boundary line itself: a date on a link line may still describe
+  // a required action. Only subsequent lines are treated as footer text.
+  return boundary === -1 ? body : lines.slice(0, boundary + 1).join('\n');
+}
 
 function upcoming(
   start: chrono.ParsedComponents,
@@ -47,7 +65,8 @@ export function shortlistReason(mail: CollectedMail, now: Date): string | undefi
   }
 
   const subject = unwrapForward(mail).subject.replace(/https?:\/\/\S+/gi, '');
-  const text = (subject + '\n' + modelText(mail)).normalize('NFKC');
+  const body = bodyBeforeFooter(modelText(mail).normalize('NFKC'));
+  const text = subject.normalize('NFKC') + '\n' + body;
   for (let offset = 0; offset < text.length; offset += 3800) {
     const chunk = text.slice(offset, offset + 4096);
     for (const parser of [chrono.ja, chrono.en]) {
