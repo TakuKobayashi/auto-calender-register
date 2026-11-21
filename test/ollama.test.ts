@@ -252,6 +252,57 @@ test('モデルが日付を捏造しても原文との照合で保留', () => {
   assert.equal(extractionToPlan(mail(), e, now, finalize).decision, 'review');
 });
 
+test('オンライン予定には元メールの参加相手と会議リンクを載せる', () => {
+  const original = mail({
+    subject: 'オンライン面接が確定しました',
+    text: [
+      '面接が確定しました。',
+      '日時：2026年11月20日 15:00–15:45（日本時間）',
+      '',
+      '参加者',
+      '',
+      '応募者 user@yahoo.co.jp',
+      '採用担当 reviewer@example.com',
+      '',
+      'Web会議',
+      'URL: https://meet.google.com/abc-defg-hij',
+      '日程の変更：https://schedule.example.com/manage',
+      '> 前回の会議 https://meet.google.com/xyz-abcd-efg',
+    ].join('\n'),
+  });
+  const result = extraction();
+  Object.assign(result.events[0]!, {
+    title: 'オンライン面接',
+    endLocal: '2026-11-20T15:45:00',
+    location: '',
+    startEvidence: '2026年11月20日 15:00–15:45',
+    endEvidence: '2026年11月20日 15:00–15:45',
+    zoneEvidence: '日本時間',
+    confirmationEvidence: '面接が確定しました。',
+    calendarNotes: [
+      { text: '11/20 15:00–15:45（日本時間）', evidence: '2026年11月20日 15:00–15:45（日本時間）' },
+    ],
+  });
+  const event = extractionToPlan(original, result, now, finalize).events[0]!;
+  assert.equal(event.decision, 'candidate');
+  assert.equal(
+    event.payload?.description,
+    [
+      '11/20 15:00–15:45（日本時間）',
+      '参加相手：採用担当',
+      '参加リンク：https://meet.google.com/abc-defg-hij',
+    ].join('\n'),
+  );
+  assert.doesNotMatch(modelText(original), /meet\.google\.com/);
+
+  const ambiguous = {
+    ...original,
+    text: '別の参加リンク: https://example.zoom.us/j/123456789\n' + original.text,
+  };
+  const ambiguousEvent = extractionToPlan(ambiguous, result, now, finalize).events[0]!;
+  assert.equal(ambiguousEvent.payload?.description, '11/20 15:00–15:45（日本時間）');
+});
+
 test('IANA名だけを引用したふりにしても本文に存在しなければ保留', () => {
   const e = extraction();
   e.events[0]!.zoneEvidence = 'Asia/Tokyo';
