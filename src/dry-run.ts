@@ -113,6 +113,9 @@ export async function writeDryRun(
     requests: 0,
     uncachedMails: 0,
   };
+  const total = collection.messages.length;
+  const progressOnly = options.mailDetails === false;
+  if (progressOnly) console.error(`メール選別: 0/${total}件処理済み`);
   if (model) {
     const initial = classifyAll(collection.messages, now);
     const filterErrors = new Map<CollectedMail, unknown>();
@@ -142,10 +145,13 @@ export async function writeDryRun(
         reasons: [...plan.reasons, reason, '自動登録しない'],
       });
     };
-    for (let i = 0; i < collection.messages.length; i++) {
+    for (let i = 0; i < total; i++) {
+      if (progressOnly && i > 0 && i % 25 === 0)
+        console.error(`メール選別: ${i}/${total}件処理済み`);
       const mail = collection.messages[i]!;
       const plan = initial[i]!;
       let key: string | undefined;
+      let requested = false;
       try {
         if (filterErrors.has(mail)) throw filterErrors.get(mail);
         if (!candidates.has(mail)) {
@@ -200,17 +206,23 @@ export async function writeDryRun(
         }
         llm.uncachedMails++;
         llm.requests++;
-        if (options.mailDetails !== false)
-          console.error(`LLM判定対象: ${mailLabel(mail)} ｜ ${shortlist}`);
+        requested = true;
+        if (progressOnly)
+          console.error(`メール選別: ${i}/${total}件処理済み（${i + 1}件目をLLMで判定中）`);
+        else console.error(`LLM判定対象: ${mailLabel(mail)} ｜ ${shortlist}`);
         const extraction = await extractWithOllama(mail, model);
         await store?.saveExtraction(key, model, extraction);
         applyExtraction(mail, plan, extraction);
       } catch (error) {
         await recordFailure(mail, plan, error, key);
       }
+      const processed = i + 1;
+      if (progressOnly && requested && processed < total && processed % 25 !== 0)
+        console.error(`メール選別: ${processed}/${total}件処理済み`);
     }
   }
   const plans = classifyAll(collection.messages, now, overrides);
+  if (progressOnly && total) console.error(`メール選別: ${total}/${total}件処理済み`);
   if (existingFile) {
     const raw = JSON.parse(await readFile(existingFile, 'utf8'));
     const existing: ExistingEvent[] = Array.isArray(raw) ? raw : raw.items;

@@ -175,6 +175,8 @@ test('CLIのログを抑制しても件数とファイル出力を維持する',
       if (flags.length) {
         assert.equal(summary.proposed, undefined);
         assert.doesNotMatch(stdout + stderr, /PRIVATE_|sender@example\.test/);
+        assert.match(stderr, /メール選別: 0\/1件処理済み/);
+        assert.match(stderr, /メール選別: 1\/1件処理済み/);
       } else {
         assert.equal(summary.proposed[0].subject, subject);
         assert.equal(summary.proposed[0].title, title);

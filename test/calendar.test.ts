@@ -89,7 +89,10 @@ test('詳細を非表示にしてもカレンダーの照合結果を保存で�
     now: () => now,
     mailDetails: false,
   });
-  assert.equal(logs.mock.callCount(), 1);
+  assert.deepEqual(
+    logs.mock.calls.slice(1).map((call) => call.arguments[0]),
+    ['カレンダー照合: 0/1件処理済み', 'カレンダー照合: 1/1件処理済み'],
+  );
   assert.equal(rows[0]?.action, 'would_create');
   assert.equal(rows[0]?.sourceSubject, 'PRIVATE_SUBJECT');
 });

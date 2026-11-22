@@ -54,6 +54,7 @@ test('長すぎる本文は推論せず要確認とし、候補を作らず処�
 });
 
 test('LLMタイムアウトは理由を保存し、未完了のまま登録を止める', async (t) => {
+  const logs = t.mock.method(console, 'error', () => {});
   t.mock.method(globalThis, 'fetch', async (input: string | URL | Request) => {
     if (String(input).endsWith('/api/tags'))
       return Response.json({ models: [{ name: 'timeout-test', digest: 'a'.repeat(64) }] });
@@ -61,10 +62,26 @@ test('LLMタイムアウトは理由を保存し、未完了のまま登録を�
     throw new DOMException('timeout', 'TimeoutError');
   });
   const directory = await mkdtemp(join(tmpdir(), 'calendar-timeout-'));
-  const result = await writeDryRun(collection(mail()), directory, undefined, now, 'timeout-test');
+  const result = await writeDryRun(
+    collection(mail()),
+    directory,
+    undefined,
+    now,
+    'timeout-test',
+    undefined,
+    { mailDetails: false },
+  );
   assert.equal(result.complete, false);
   assert.equal(result.summary.error, 1);
   assert.equal(result.proposed.length, 0);
+  assert.deepEqual(
+    logs.mock.calls.map((call) => call.arguments[0]),
+    [
+      'メール選別: 0/1件処理済み',
+      'メール選別: 0/1件処理済み（1件目をLLMで判定中）',
+      'メール選別: 1/1件処理済み',
+    ],
+  );
   assert.match(result.messages[0]!.reasons.join(' '), /制限時間/);
   assert.match(await readFile(join(directory, 'dry-run.md'), 'utf8'), /処理エラー[\s\S]*制限時間/);
 });

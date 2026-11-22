@@ -133,4 +133,4 @@ ICS出力はGoogleの既存予定との照合を含みません。取り込み�
 
 登録先は認証したGoogleアカウントのメインカレンダーです。SQLダンプの確認・取得は [Artifactsのダウンロード手順](database.md#github-actions) を参照してください。
 
-Actionsでは `--no-mail-details` を指定し、コンソールには件数と実行状況を表示します。ローカルでは既定で詳細を表示し、`calendar:dry-run`、`calendar:plan`、`calendar:register`、`calendar:ics` に同じオプションを指定できます。
+Actionsでは `--no-mail-details` を指定し、コンソールには取得・選別・照合の処理済み件数と対象件数を表示します。LLM判定を開始すると、判定中のメールが何件目かも表示します。ローカルでは既定で詳細を表示し、`calendar:dry-run`、`calendar:plan`、`calendar:register`、`calendar:ics` に同じオプションを指定できます。

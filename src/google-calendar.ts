@@ -180,6 +180,8 @@ export async function syncCalendar(
   const rows: SyncRow[] = [];
   const withinBatch: GoogleEvent[] = [];
   const clock = options.now ?? (() => new Date());
+  const total = selection.events.length;
+  if (options.mailDetails === false) console.error(`カレンダー照合: 0/${total}件処理済み`);
   for (const selected of selection.events) {
     const row: SyncRow = {
       eventKey: selected.eventKey,
@@ -264,6 +266,8 @@ export async function syncCalendar(
       );
     rows.push(row);
     if (options.checkpoint) await options.checkpoint(rows);
+    if (options.mailDetails === false)
+      console.error(`カレンダー照合: ${rows.length}/${total}件処理済み`);
   }
   return rows;
 }
