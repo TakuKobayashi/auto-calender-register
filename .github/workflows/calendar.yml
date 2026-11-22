@@ -11,7 +11,7 @@ on:
       apply:
         description: 'Googleカレンダーへ実際に登録する'
         type: boolean
-        default: false
+        default: true
       model:
         description: 'Ollamaモデル（空欄はルール方式のみ）'
         type: string
