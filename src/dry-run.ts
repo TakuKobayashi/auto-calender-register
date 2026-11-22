@@ -12,6 +12,7 @@ import {
   validateExtraction,
   checkedModelText,
   OllamaError,
+  OllamaTimeoutError,
   ollamaFailureReason,
   isReviewOutcome,
   type Extraction,
@@ -112,6 +113,7 @@ export async function writeDryRun(
     cacheHits: 0,
     requests: 0,
     uncachedMails: 0,
+    deferredTimeouts: 0,
   };
   const total = collection.messages.length;
   const progressOnly = options.mailDetails === false;
@@ -139,9 +141,12 @@ export async function writeDryRun(
       error: unknown,
       key?: string,
     ) => {
-      const decision = error instanceof OllamaError && error.needsReview ? 'review' : 'error';
+      const timedOut = error instanceof OllamaTimeoutError;
+      const cacheReview = error instanceof OllamaError && error.needsReview;
+      const decision = timedOut || cacheReview ? 'review' : 'error';
       const reason = ollamaFailureReason(error);
-      if (decision === 'review' && key && store)
+      if (timedOut) llm.deferredTimeouts++;
+      if (cacheReview && key && store)
         await store.saveExtraction(key, model, { kind: 'review', reason });
       if (options.mailDetails !== false)
         console.error(`登録しない: ${mailLabel(mail)} ｜ ${reason}`);

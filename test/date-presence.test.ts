@@ -232,6 +232,7 @@ test('日時候補がないメールや販促メールはモデルを呼ばな�
     cacheHits: 0,
     requests: 0,
     uncachedMails: 0,
+    deferredTimeouts: 0,
   });
 });
 

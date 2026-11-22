@@ -16,10 +16,19 @@ export class OllamaError extends Error {
   }
 }
 
+export class OllamaTimeoutError extends OllamaError {
+  constructor() {
+    super('Ollamaの応答が制限時間を超えました。次回実行で再試行します。');
+  }
+}
+
+function isTimeout(error: unknown) {
+  return error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name);
+}
+
 export function ollamaFailureReason(error: unknown) {
   if (error instanceof OllamaError) return error.message;
-  if (error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name))
-    return 'Ollamaの応答が制限時間を超えました。次回実行で再試行します。';
+  if (isTimeout(error)) return 'Ollamaの応答が制限時間を超えました。次回実行で再試行します。';
   if (error instanceof SyntaxError) return 'Ollamaの応答が有効なJSONではありません。';
   if (error instanceof TypeError)
     return 'ローカルOllamaへの接続に失敗しました。起動状態を確認してください。';
@@ -435,31 +444,36 @@ async function requestExtraction(
     throw new OllamaError('OLLAMA_TIMEOUT_MSは1000〜1800000の整数で指定してください。');
   // アカウント本文を外部ホストに送らないよう接続先はループバック固定。
   await localModelDigest(model);
-  const response = await fetch('http://127.0.0.1:11434/api/chat', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    signal: AbortSignal.timeout(timeoutMs),
-    body: JSON.stringify({
-      model,
-      stream: true,
-      think: false,
-      format: schema,
-      options: {
-        temperature: 0,
-        seed: 42,
-        presence_penalty: 0,
-        repeat_penalty: 1,
-        num_ctx: 12288,
-        num_predict: outputTokens,
-      },
-      messages: [
-        { role: 'system', content: prompt },
-        { role: 'user', content: JSON.stringify(input) },
-      ],
-    }),
-  });
-  if (!response.ok) throw new OllamaError(`Ollama応答エラー: HTTP ${response.status}`);
-  return JSON.parse(await readOllamaChat(response));
+  try {
+    const response = await fetch('http://127.0.0.1:11434/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(timeoutMs),
+      body: JSON.stringify({
+        model,
+        stream: true,
+        think: false,
+        format: schema,
+        options: {
+          temperature: 0,
+          seed: 42,
+          presence_penalty: 0,
+          repeat_penalty: 1,
+          num_ctx: 12288,
+          num_predict: outputTokens,
+        },
+        messages: [
+          { role: 'system', content: prompt },
+          { role: 'user', content: JSON.stringify(input) },
+        ],
+      }),
+    });
+    if (!response.ok) throw new OllamaError(`Ollama応答エラー: HTTP ${response.status}`);
+    return JSON.parse(await readOllamaChat(response));
+  } catch (error) {
+    if (isTimeout(error)) throw new OllamaTimeoutError();
+    throw error;
+  }
 }
 
 export async function readOllamaChat(response: Response): Promise<string> {

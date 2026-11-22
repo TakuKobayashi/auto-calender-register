@@ -17,6 +17,8 @@ import {
 } from '../src/ollama.js';
 import { filterGmailForwards, matchOriginal } from '../src/forward-audit.js';
 import { reconcileModelPlan, writeDryRun } from '../src/dry-run.js';
+import type { Store } from '../src/db/store.js';
+import { validateSelection } from '../src/selection.js';
 
 const now = new Date('2026-11-16T00:00:00Z');
 
@@ -53,38 +55,67 @@ test('長すぎる本文は推論せず要確認とし、候補を作らず処�
   assert.match(result.messages[0]!.reasons.join(' '), /上限24000文字/);
 });
 
-test('LLMタイムアウトは理由を保存し、未完了のまま登録を止める', async (t) => {
+test('個別のLLMタイムアウトだけを次回に再試行し、判定済みの予定は登録候補に残す', async (t) => {
+  const timedOutMail = mail({ subject: 'PRIVATE_TIMEOUT', text: '日時：2026年11月20日 15:00 JST' });
+  const confirmedMail = mail({ uid: 2 });
+  const calls: string[] = [];
   const logs = t.mock.method(console, 'error', () => {});
-  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request) => {
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
     if (String(input).endsWith('/api/tags'))
       return Response.json({ models: [{ name: 'timeout-test', digest: 'a'.repeat(64) }] });
     if (String(input).endsWith('/api/show')) return Response.json({ details: { format: 'gguf' } });
-    throw new DOMException('timeout', 'TimeoutError');
+    const request = JSON.parse(String(init?.body));
+    const mailInput = JSON.parse(request.messages.at(-1).content);
+    calls.push(mailInput.subject);
+    if (mailInput.subject === timedOutMail.subject) {
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.error(new DOMException('timeout', 'TimeoutError'));
+          },
+        }),
+      );
+    }
+    return new Response(
+      JSON.stringify({ message: { content: JSON.stringify(extraction()) }, done: true }) + '\n',
+    );
   });
+
   const directory = await mkdtemp(join(tmpdir(), 'calendar-timeout-'));
-  const result = await writeDryRun(
-    collection(mail()),
-    directory,
-    undefined,
-    now,
-    'timeout-test',
-    undefined,
-    { mailDetails: false },
-  );
-  assert.equal(result.complete, false);
-  assert.equal(result.summary.error, 1);
-  assert.equal(result.proposed.length, 0);
+  const input = {
+    ...collection(timedOutMail),
+    messages: [timedOutMail, confirmedMail],
+    matched: 2,
+  };
+  const extractions = new Map<string, Extraction>();
+  const store = {
+    getExtraction: async (key: string) => extractions.get(key),
+    saveExtraction: async (key: string, _model: string, extraction: Extraction) =>
+      extractions.set(key, extraction),
+  } as unknown as Store;
+  const run = () =>
+    writeDryRun(input, directory, undefined, now, 'timeout-test', store, { mailDetails: false });
+  const result = await run();
+  assert.equal(result.complete, true);
+  assert.equal(result.summary.error, 0);
+  assert.equal(result.summary.review, 1);
+  assert.equal(result.llm.deferredTimeouts, 1);
+  assert.equal(extractions.size, 1);
   assert.deepEqual(
-    logs.mock.calls.map((call) => call.arguments[0]),
-    [
-      'メール選別: 0/1件処理済み / LLMキャッシュ再利用: 0件 / 新規判定開始: 0件',
-      'LLM判定の内訳: キャッシュ再利用 0件 / 新規判定待ち 1件',
-      'メール選別: 0/1件処理済み（1件目をLLMで判定中） / LLMキャッシュ再利用: 0件 / 新規判定開始: 1件',
-      'メール選別: 1/1件処理済み / LLMキャッシュ再利用: 0件 / 新規判定開始: 1件',
-    ],
+    validateSelection(result, now).events.map((e) => e.sourceUid),
+    [confirmedMail.uid],
   );
-  assert.match(result.messages[0]!.reasons.join(' '), /制限時間/);
-  assert.match(await readFile(join(directory, 'dry-run.md'), 'utf8'), /処理エラー[\s\S]*制限時間/);
+  assert.doesNotMatch(
+    logs.mock.calls.map((call) => call.arguments.join(' ')).join('\n'),
+    /PRIVATE_TIMEOUT/,
+  );
+  assert.match(result.messages[0]!.reasons.join(' '), /次回実行で再試行/);
+
+  const next = await run();
+  assert.equal(next.complete, true);
+  assert.equal(next.llm.cacheHits, 1);
+  assert.equal(next.llm.requests, 1);
+  assert.deepEqual(calls, [timedOutMail.subject, confirmedMail.subject, timedOutMail.subject]);
 });
 
 test('モデル更新でdigestが変われば、同じモデル名とメールでも抽出キャッシュを更新する', () => {
