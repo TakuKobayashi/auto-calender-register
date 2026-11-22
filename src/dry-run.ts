@@ -115,7 +115,14 @@ export async function writeDryRun(
   };
   const total = collection.messages.length;
   const progressOnly = options.mailDetails === false;
-  if (progressOnly) console.error(`メール選別: 0/${total}件処理済み`);
+  const logProgress = (processed: number, runningLlm = false) => {
+    const active = runningLlm ? `（${processed + 1}件目をLLMで判定中）` : '';
+    const counts = model
+      ? ` / LLMキャッシュ再利用: ${llm.cacheHits}件 / 新規判定開始: ${llm.requests}件`
+      : '';
+    console.error(`メール選別: ${processed}/${total}件処理済み${active}${counts}`);
+  };
+  if (progressOnly) logProgress(0);
   if (model) {
     const initial = classifyAll(collection.messages, now);
     const filterErrors = new Map<CollectedMail, unknown>();
@@ -145,13 +152,32 @@ export async function writeDryRun(
         reasons: [...plan.reasons, reason, '自動登録しない'],
       });
     };
+    const reuseExtraction = async (mail: CollectedMail, plan: MailPlan, key: string) => {
+      const cached = await store?.getExtraction(key);
+      if (!cached || (isReviewOutcome(cached) && options.retryReviews)) return false;
+      llm.cacheHits++;
+      if (isReviewOutcome(cached)) {
+        overrides.set(mail.uid, {
+          ...plan,
+          decision: 'review',
+          events: [],
+          reasons: [
+            ...plan.reasons,
+            cached.reason,
+            '入力・モデルが同じため保存済みの要確認結果を使用。自動登録しない',
+          ],
+        });
+      } else {
+        applyExtraction(mail, plan, validateExtraction(cached));
+      }
+      return true;
+    };
+    const pending: { mail: CollectedMail; plan: MailPlan; key: string; shortlist: string }[] = [];
     for (let i = 0; i < total; i++) {
-      if (progressOnly && i > 0 && i % 25 === 0)
-        console.error(`メール選別: ${i}/${total}件処理済み`);
+      if (progressOnly && i > 0 && i % 25 === 0) logProgress(i - pending.length);
       const mail = collection.messages[i]!;
       const plan = initial[i]!;
       let key: string | undefined;
-      let requested = false;
       try {
         if (filterErrors.has(mail)) throw filterErrors.get(mail);
         if (!candidates.has(mail)) {
@@ -185,44 +211,37 @@ export async function writeDryRun(
         }
         checkedModelText(mail);
         key = extractionCacheKey(mail, model, await localModelDigest(model));
-        const cached = await store?.getExtraction(key);
-        if (cached && !(isReviewOutcome(cached) && options.retryReviews)) llm.cacheHits++;
-        if (isReviewOutcome(cached) && !options.retryReviews) {
-          overrides.set(mail.uid, {
-            ...plan,
-            decision: 'review',
-            events: [],
-            reasons: [
-              ...plan.reasons,
-              cached.reason,
-              '入力・モデルが同じため保存済みの要確認結果を使用。自動登録しない',
-            ],
-          });
-          continue;
-        }
-        if (cached && !isReviewOutcome(cached)) {
-          applyExtraction(mail, plan, validateExtraction(cached));
-          continue;
-        }
-        llm.uncachedMails++;
-        llm.requests++;
-        requested = true;
-        if (progressOnly)
-          console.error(`メール選別: ${i}/${total}件処理済み（${i + 1}件目をLLMで判定中）`);
-        else console.error(`LLM判定対象: ${mailLabel(mail)} ｜ ${shortlist}`);
-        const extraction = await extractWithOllama(mail, model);
-        await store?.saveExtraction(key, model, extraction);
-        applyExtraction(mail, plan, extraction);
+        if (!(await reuseExtraction(mail, plan, key))) pending.push({ mail, plan, key, shortlist });
       } catch (error) {
         await recordFailure(mail, plan, error, key);
       }
-      const processed = i + 1;
-      if (progressOnly && requested && processed < total && processed % 25 !== 0)
-        console.error(`メール選別: ${processed}/${total}件処理済み`);
+    }
+    if (progressOnly && pending.length)
+      console.error(
+        `LLM判定の内訳: キャッシュ再利用 ${llm.cacheHits}件 / 新規判定待ち ${pending.length}件`,
+      );
+
+    for (const [index, { mail, plan, key, shortlist }] of pending.entries()) {
+      const processed = total - pending.length + index;
+      try {
+        // A preceding request in this run may have saved an identical input.
+        if (!(await reuseExtraction(mail, plan, key))) {
+          llm.uncachedMails++;
+          llm.requests++;
+          if (progressOnly) logProgress(processed, true);
+          else console.error(`LLM判定対象: ${mailLabel(mail)} ｜ ${shortlist}`);
+          const extraction = await extractWithOllama(mail, model);
+          await store?.saveExtraction(key, model, extraction);
+          applyExtraction(mail, plan, extraction);
+        }
+      } catch (error) {
+        await recordFailure(mail, plan, error, key);
+      }
+      if (progressOnly && processed + 1 < total) logProgress(processed + 1);
     }
   }
   const plans = classifyAll(collection.messages, now, overrides);
-  if (progressOnly && total) console.error(`メール選別: ${total}/${total}件処理済み`);
+  if (progressOnly && total) logProgress(total);
   if (existingFile) {
     const raw = JSON.parse(await readFile(existingFile, 'utf8'));
     const existing: ExistingEvent[] = Array.isArray(raw) ? raw : raw.items;

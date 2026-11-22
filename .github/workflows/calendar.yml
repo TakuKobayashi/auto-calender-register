@@ -32,7 +32,7 @@ jobs:
   calendar:
     if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 300
     defaults:
       run:
         shell: bash
@@ -118,7 +118,9 @@ jobs:
             gpg --batch --pinentry-mode loopback --passphrase-fd 0 \
               --decrypt "$DB_ARTIFACT_DIR/calendar-db.tar.gz.gpg" |
             tar -xzf - -C db/dumps
-          npm run db:restore
+          npm run --silent db:restore |
+            jq -r '.tables | map({key: .name, value: .rows}) | from_entries |
+              "SQL復元: メール \(.mails)件 / LLM判定キャッシュ \(.extractions)件 / 登録状態 \(.calendar_states)件"'
 
       - name: Restore Ollama and model
         if: env.OLLAMA_MODEL != ''
@@ -165,7 +167,7 @@ jobs:
           key: ${{ steps.ollama_cache.outputs.cache-primary-key }}
 
       - name: Collect and classify
-        timeout-minutes: 95
+        timeout-minutes: 271
         env:
           YAHOO_IMAP_USER: ${{ secrets.YAHOO_IMAP_USER }}
           YAHOO_IMAP_PASSWORD: ${{ secrets.YAHOO_IMAP_PASSWORD }}
@@ -174,7 +176,7 @@ jobs:
           if [[ -n "$SCAN_SINCE" ]]; then args+=(--since "$SCAN_SINCE"); fi
           if [[ -n "$OLLAMA_MODEL" ]]; then args+=(--ollama-model "$OLLAMA_MODEL"); fi
           status=0
-          timeout --kill-after=10s 94m npm "${args[@]}" || status=$?
+          timeout --kill-after=10s 270m npm "${args[@]}" || status=$?
           if [[ "$status" = 124 || "$status" = 137 ]]; then
             echo '::error::メールの取得・選別が制限時間に達しました。保存済みの進捗をSQLに出力します。'
           fi
