@@ -126,7 +126,7 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
     };
     await store.saveMail(scope, mail);
     await t.test(
-      'restored extractions skip inference and each uncached mail is processed once and saved',
+      'restored extractions skip inference and uncached mail is processed newest first',
       async (t) => {
         const digest = 'a'.repeat(64);
         const logs = t.mock.method(console, 'error', () => {});
@@ -169,6 +169,13 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
           ...mail,
           source: undefined,
           uid: i + 1,
+          receivedAt: [
+            '2026-11-03T00:00:00Z',
+            '2026-11-15T00:00:00Z',
+            null,
+            '2026-11-16T00:00:00Z',
+          ][i]!,
+          date: '2026-11-10T00:00:00Z',
           subject: '面接日程が確定 ' + label,
           text: '日時：2026年11月20日 15:00 JST',
         }));
@@ -205,10 +212,7 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
         assert.equal(report.complete, true);
         assert.equal(report.llm.cacheHits, 1);
         assert.equal(report.llm.requests, 3);
-        assert.deepEqual(
-          calls,
-          messages.slice(0, -1).map((m) => m.subject),
-        );
+        assert.deepEqual(calls, [messages[1]!.subject, messages[2]!.subject, messages[0]!.subject]);
         assert.deepEqual(
           report.messages.slice(0, -1).map((m) => m.reasons[0]),
           messages.slice(0, -1).map((m) => `ローカルLLM: ${m.subject}`),

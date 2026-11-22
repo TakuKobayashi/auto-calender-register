@@ -221,6 +221,13 @@ export async function writeDryRun(
         `LLM判定の内訳: キャッシュ再利用 ${llm.cacheHits}件 / 新規判定待ち ${pending.length}件`,
       );
 
+    const receivedTime = (mail: CollectedMail) => {
+      const received = Date.parse(mail.receivedAt ?? '');
+      if (Number.isFinite(received)) return received;
+      const sent = Date.parse(mail.date ?? '');
+      return Number.isFinite(sent) ? sent : -Infinity;
+    };
+    pending.sort((a, b) => receivedTime(b.mail) - receivedTime(a.mail));
     for (const [index, { mail, plan, key, shortlist }] of pending.entries()) {
       const processed = total - pending.length + index;
       try {
