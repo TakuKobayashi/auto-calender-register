@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { normalizeYahooCache, selectYahooMailbox } from '../src/sources/yahoo.js';
 import type { Collection, CollectedMail } from '../src/collect.js';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
@@ -113,6 +113,81 @@ test('CLIで複数フォルダーを指定してキャッシュから選別す�
   assert.equal(result.complete, true);
   assert.equal(result.summary.checked, 2);
 });
+test('CLIのログを抑制しても件数とファイル出力を維持する', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'calendar-private-console-'));
+  const original = cache();
+  const subject = '予約が確定しました PRIVATE_SUBJECT';
+  const title = 'PRIVATE_EVENT';
+  original.since = '2026-09-30T15:00:00.000Z';
+  original.messages = [
+    {
+      ...message('INBOX'),
+      subject,
+      calendarParts: [
+        [
+          'BEGIN:VCALENDAR',
+          'VERSION:2.0',
+          'BEGIN:VEVENT',
+          'UID:private-test@example.test',
+          'DTSTAMP:20261101T000000Z',
+          'DTSTART:20991120T100000Z',
+          'DTEND:20991120T110000Z',
+          'SUMMARY:' + title,
+          'END:VEVENT',
+          'END:VCALENDAR',
+        ].join('\r\n'),
+      ],
+    },
+  ];
+  const failedSubject = 'PRIVATE_FAILED_SUBJECT';
+  original.errors = [
+    {
+      ...original.errors[0]!,
+      subject: failedSubject,
+      source: { ...message('INBOX').source!, messageId: '43' },
+    },
+  ];
+  original.complete = false;
+  original.matched = 2;
+  const input = join(directory, 'mail-cache.json');
+  await writeFile(input, JSON.stringify(original));
+  for (const flags of [[], ['--no-mail-details']]) {
+    const args = [
+      '--import',
+      'tsx',
+      'src/cli.ts',
+      'dry-run',
+      '--since',
+      '2026-10-01',
+      '--from-cache',
+      input,
+      '--output-dir',
+      directory,
+      '--no-database',
+      ...flags,
+    ];
+    await assert.rejects(promisify(execFile)(process.execPath, args), (error: unknown) => {
+      const { stdout, stderr, code } = error as { stdout: string; stderr: string; code: number };
+      assert.equal(code, 2);
+      const summary = JSON.parse(stdout);
+      assert.equal(summary.summary.checked, 2);
+      assert.equal(summary.summary.register, 1);
+      if (flags.length) {
+        assert.equal(summary.proposed, undefined);
+        assert.doesNotMatch(stdout + stderr, /PRIVATE_|sender@example\.test/);
+      } else {
+        assert.equal(summary.proposed[0].subject, subject);
+        assert.equal(summary.proposed[0].title, title);
+        assert.ok(stderr.includes(failedSubject));
+      }
+      return true;
+    });
+  }
+  const report = JSON.parse(await readFile(join(directory, 'dry-run.json'), 'utf8'));
+  assert.equal(report.proposed[0].sourceSubject, subject);
+  assert.equal(report.proposed[0].payload.summary, title);
+});
+
 test('単一フォルダーの旧キャッシュも同じ対象指定に従う', () => {
   const original = cache();
   original.mailbox = 'Shopping';

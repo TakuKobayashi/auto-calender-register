@@ -104,11 +104,13 @@ db/dumps/
 
 毎回、空のPostgreSQLを起動します。前回のArtifactsがあれば最新の暗号化SQLダンプを復元し、初回は空DBから開始します。新しいダンプのアップロードが成功した後に、古いDBダンプのArtifactsを削除します。
 
-SQL一式は **Actions → Mail calendar → 最新のダンプを保存した実行 → Artifacts** にある `mail-calendar-sql-…` からダウンロードできます。ZIPを展開して、Git Bashで次を実行するとテーブル別のSQLを取り出せます。暗号化に使うパスフレーズは `CALENDAR_DB_PASSPHRASE` です。
+SQL一式は **Actions → Mail calendar → 最新のダンプを保存した実行 → Artifacts** にある `mail-calendar-sql-…` からダウンロードできます。ZIPを展開し、`db/dumps/` に `calendar-db.tar.gz.gpg` を置いてから、プロジェクトのルートで次を実行します。ダンプ作成時の `GOOGLE_REFRESH_TOKEN` を `.env` に設定してください。
 
 ```bash
 mkdir -p db/dumps/imported
-gpg --decrypt calendar-db.tar.gz.gpg | tar -xzf - -C db/dumps/imported
+node --env-file=.env -e 'const token = process.env.GOOGLE_REFRESH_TOKEN; if (!token) process.exit(1); console.log(token)' |
+  gpg --batch --pinentry-mode loopback --passphrase-fd 0 --decrypt db/dumps/calendar-db.tar.gz.gpg |
+  tar -xzf - -C db/dumps/imported
 npm run db:restore -- --directory db/dumps/imported
 ```
 

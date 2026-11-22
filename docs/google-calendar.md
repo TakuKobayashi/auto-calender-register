@@ -110,24 +110,15 @@ ICS出力はGoogleの既存予定との照合を含みません。取り込み�
 
 ## GitHub Actions
 
-ローカルでOAuth認証後、認証JSON全体をRepository Secretに設定します。
+「Settings → Secrets and variables → Actions → New repository secret」で、ローカルの `.env` と同じ名前・値を登録します。
 
-```powershell
-npm run auth:export
-Get-Content -Raw -LiteralPath .secrets/github-google-oauth.json | gh secret set GOOGLE_OAUTH_JSON --repo OWNER/REPO
-```
-
-GitHubの画面からは「Settings → Secrets and variables → Actions → New repository secret」で登録できます。
-
-| Secret                   | 内容                                         |
-| ------------------------ | -------------------------------------------- |
-| `YAHOO_IMAP_USER`        | Yahoo! JAPAN ID                              |
-| `YAHOO_IMAP_PASSWORD`    | Yahoo!メールのIMAP用パスワード               |
-| `GOOGLE_OAUTH_JSON`      | OAuth認証JSON全体                            |
-| `CALENDAR_DB_PASSPHRASE` | DBダンプ暗号化用のランダムな長いパスフレーズ |
-
-他の実行環境でも `GOOGLE_OAUTH_JSON` にJSON文字列を渡せます。
-認証情報の読み込み順は、JSON環境変数 → `GOOGLE_CLIENT_ID`・`GOOGLE_CLIENT_SECRET`・`GOOGLE_REFRESH_TOKEN` → ローカル認証ファイルです。
+| Secret                 | 内容                                    |
+| ---------------------- | --------------------------------------- |
+| `YAHOO_IMAP_USER`      | Yahoo! JAPAN ID                         |
+| `YAHOO_IMAP_PASSWORD`  | Yahoo!メールのIMAP用パスワード          |
+| `GOOGLE_CLIENT_ID`     | デスクトップアプリ用OAuthクライアントID |
+| `GOOGLE_CLIENT_SECRET` | 同じOAuthクライアントのシークレット     |
+| `GOOGLE_REFRESH_TOKEN` | ローカル認証済みのリフレッシュトークン  |
 
 [calendar.yml](../.github/workflows/calendar.yml) はデフォルトブランチで毎日 **01:00・09:00・17:00（日本時間）** にメールを確認し、確定予定を登録します。手動確認は **Actions → Mail calendar → Run workflow** から実行できます。
 
@@ -141,3 +132,5 @@ GitHubの画面からは「Settings → Secrets and variables → Actions → Ne
 定期実行のモデルはリポジトリ変数 `OLLAMA_MODEL` で変更できます。既定は `qwen3.5:9b` です。Ollama本体・モデル・npmのダウンロードを再利用します。
 
 登録先は認証したGoogleアカウントのメインカレンダーです。SQLダンプの確認・取得は [Artifactsのダウンロード手順](database.md#github-actions) を参照してください。
+
+Actionsでは `--no-mail-details` を指定し、コンソールには件数と実行状況を表示します。ローカルでは既定で詳細を表示し、`calendar:dry-run`、`calendar:plan`、`calendar:register`、`calendar:ics` に同じオプションを指定できます。

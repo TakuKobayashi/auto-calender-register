@@ -55,6 +55,10 @@ const program = new Command()
   .name('yahoo-mail')
   .description('Yahoo! JAPANメールの予定抽出・Googleカレンダー登録・ICS出力')
   .version('0.1.0');
+let showMailDetails = true;
+program.hook('preAction', (_program, command) => {
+  showMailDetails = command.opts().mailDetails !== false;
+});
 
 const output = (value: unknown) => console.log(JSON.stringify(value, null, 2));
 
@@ -126,6 +130,7 @@ program
   )
   .option('--ollama-model <name>', 'ローカルOllamaで文脈を再判定（実験機能・モデル指定必須）')
   .option('--retry-reviews', 'LLM出力上限等で保存した要確認結果を再推論する', false)
+  .option('--no-mail-details', 'コンソールにメールや予定の詳細を表示しない')
   .option('--database', 'PostgreSQLへ進捗・抽出結果を保存（既定で有効）', true)
   .option('--no-database', 'DBを使わずJSONのみ保存')
   .action(async (options) =>
@@ -140,7 +145,14 @@ program
               normalizeYahooCache(await readCollection(options.fromCache, since), mailAccount()),
               options.mailbox,
             )
-          : await collectYahoo(since, options.outputDir, options.maxBytes, options.mailbox, store);
+          : await collectYahoo(
+              since,
+              options.outputDir,
+              options.maxBytes,
+              options.mailbox,
+              store,
+              options.mailDetails,
+            );
         if (store && options.fromCache) {
           collection.messages = mergeMessages(collection.messages);
           const scopes = new Map(
@@ -169,7 +181,7 @@ program
           new Date(),
           options.ollamaModel,
           store,
-          { retryReviews: options.retryReviews },
+          { retryReviews: options.retryReviews, mailDetails: options.mailDetails },
         );
         output({
           mode: report.mode,
@@ -185,20 +197,25 @@ program
           llm: report.llm,
           report: `${options.outputDir}/dry-run.md`,
           json: `${options.outputDir}/dry-run.json`,
-          proposed: report.proposed.map((p) => ({
-            shouldRegister: true,
-            from: p.sourceFrom,
-            subject: p.sourceSubject,
-            title: p.payload!.summary,
-            start: p.payload!.allDayDate ?? p.payload!.start.dateTime,
-          })),
+          ...(options.mailDetails
+            ? {
+                proposed: report.proposed.map((p) => ({
+                  shouldRegister: true,
+                  from: p.sourceFrom,
+                  subject: p.sourceSubject,
+                  title: p.payload!.summary,
+                  start: p.payload!.allDayDate ?? p.payload!.start.dateTime,
+                })),
+              }
+            : {}),
         });
         if (!report.complete) {
           console.error(
             `メール選別が未完了のため停止しました。取得・解析エラー ${report.summary.error}件。詳細: ${options.outputDir}/dry-run.md`,
           );
-          for (const mail of report.messages.filter((m) => m.decision === 'error'))
-            console.error(`${mailLabel(mail)}: ${mail.reasons.join(' / ')}`);
+          if (options.mailDetails)
+            for (const mail of report.messages.filter((m) => m.decision === 'error'))
+              console.error(`${mailLabel(mail)}: ${mail.reasons.join(' / ')}`);
           process.exitCode = 2;
         }
         if (store && runId)
@@ -306,6 +323,7 @@ calendarCommands
   .option('--auth-file <file>', 'ローカルOAuth情報', DEFAULT_AUTH_FILE)
   .option('--apply', '重複していない未来の確定候補を実際に登録', false)
   .option('--output <file>', '照合・登録結果のJSON', 'reports/calendar-sync.json')
+  .option('--no-mail-details', 'コンソールにメールや予定の詳細を表示しない')
   .option('--database', 'PostgreSQLへ照合・登録結果を保存（既定で有効）', true)
   .option('--no-database', 'DBを使わずJSONのみ保存')
   .action(async (options) =>
@@ -344,7 +362,7 @@ calendarCommands
         output({
           mode: result.mode,
           complete: result.complete,
-          calendarId: result.calendarId,
+          ...(options.mailDetails ? { calendarId: result.calendarId } : {}),
           calendarWrites: result.calendarWrites,
           pastSkipped: result.pastSkippedAtRead,
           summary: {
@@ -371,6 +389,7 @@ calendarCommands
   .description('選別済みの未来の確定候補をICSへ出力（OAuth不要）')
   .option('--report <file>', '完了済み選別レポート', 'reports/dry-run.json')
   .option('--output <file>', 'ICS出力先', 'reports/events.ics')
+  .option('--no-mail-details', 'コンソールにメールや予定の詳細を表示しない')
   .action(async (options) =>
     output(await exportIcs(await readSelection(options.report), options.output)),
   );
@@ -379,7 +398,8 @@ try {
   await program.parseAsync();
 } catch (error) {
   // サーバー応答に含まれる可能性のある認証情報は表示しない。
-  let message = error instanceof Error ? error.message : 'メール取得に失敗しました。';
+  let message =
+    showMailDetails && error instanceof Error ? error.message : 'コマンドの実行に失敗しました。';
   for (const secret of [
     process.env.YAHOO_IMAP_PASSWORD,
     process.env.YAHOO_IMAP_USER,

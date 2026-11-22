@@ -77,6 +77,23 @@ class MemoryCalendar implements CalendarPort {
   }
 }
 
+test('詳細を非表示にしてもカレンダーの照合結果を保存できる', async (t) => {
+  const logs = t.mock.method(console, 'error', () => {});
+  const input = selection();
+  input.events[0]!.sourceSubject = 'PRIVATE_SUBJECT';
+  const port = new MemoryCalendar();
+  await syncCalendar(input, port, { apply: false, now: () => now });
+  assert.match(String(logs.mock.calls[0]?.arguments[0]), /PRIVATE_SUBJECT/);
+  const rows = await syncCalendar(input, port, {
+    apply: false,
+    now: () => now,
+    mailDetails: false,
+  });
+  assert.equal(logs.mock.callCount(), 1);
+  assert.equal(rows[0]?.action, 'would_create');
+  assert.equal(rows[0]?.sourceSubject, 'PRIVATE_SUBJECT');
+});
+
 test('candidateとpayloadの一致を確認し、過去・同じキーの重複を除外', () => {
   const raw = report();
   raw.proposed.push(structuredClone(raw.proposed[0]!));

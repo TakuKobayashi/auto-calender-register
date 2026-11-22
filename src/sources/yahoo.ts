@@ -133,12 +133,13 @@ export async function collectYahoo(
   maxBytes: number,
   mailboxes?: string[],
   store?: Store,
+  mailDetails = true,
 ): Promise<Collection> {
   const account = yahooAccount();
   const folders = yahooMailboxes(mailboxes);
   const collections: Collection[] = [];
   for (const mailbox of folders) {
-    console.error(`取得フォルダー: ${mailbox}`);
+    if (mailDetails) console.error(`取得フォルダー: ${mailbox}`);
     collections.push(
       await withMailbox(mailbox, async (client) => {
         const reader = imapReader(client, account);
@@ -148,6 +149,7 @@ export async function collectYahoo(
           join(directory, 'sources', sourceScope(reader.source)),
           maxBytes,
           store,
+          mailDetails,
         );
       }),
     );

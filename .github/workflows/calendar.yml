@@ -55,10 +55,11 @@ jobs:
         env:
           YAHOO_IMAP_USER: ${{ secrets.YAHOO_IMAP_USER }}
           YAHOO_IMAP_PASSWORD: ${{ secrets.YAHOO_IMAP_PASSWORD }}
-          GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
-          CALENDAR_DB_PASSPHRASE: ${{ secrets.CALENDAR_DB_PASSPHRASE }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
         run: |
-          for name in YAHOO_IMAP_USER YAHOO_IMAP_PASSWORD GOOGLE_OAUTH_JSON CALENDAR_DB_PASSPHRASE; do
+          for name in YAHOO_IMAP_USER YAHOO_IMAP_PASSWORD GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET GOOGLE_REFRESH_TOKEN; do
             if [[ -z "${!name}" ]]; then
               echo "::error::Missing repository secret: $name"
               exit 1
@@ -105,7 +106,7 @@ jobs:
       - name: Restore SQL snapshot
         id: load_database
         env:
-          CALENDAR_DB_PASSPHRASE: ${{ secrets.CALENDAR_DB_PASSPHRASE }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
           PRIOR_ARTIFACT_ID: ${{ steps.db_history.outputs.artifact_id }}
         run: |
           if [[ -z "$PRIOR_ARTIFACT_ID" ]]; then
@@ -113,7 +114,7 @@ jobs:
             exit 0
           fi
           mkdir -p db/dumps
-          printf '%s\n' "$CALENDAR_DB_PASSPHRASE" |
+          printf '%s\n' "$GOOGLE_REFRESH_TOKEN" |
             gpg --batch --pinentry-mode loopback --passphrase-fd 0 \
               --decrypt "$DB_ARTIFACT_DIR/calendar-db.tar.gz.gpg" |
             tar -xzf - -C db/dumps
@@ -169,44 +170,34 @@ jobs:
           YAHOO_IMAP_USER: ${{ secrets.YAHOO_IMAP_USER }}
           YAHOO_IMAP_PASSWORD: ${{ secrets.YAHOO_IMAP_PASSWORD }}
         run: |
-          mkdir -p reports
-          args=(run --silent calendar:dry-run -- --database --mailbox "$SCAN_MAILBOX")
+          args=(run --silent calendar:dry-run -- --database --no-mail-details --mailbox "$SCAN_MAILBOX")
           if [[ -n "$SCAN_SINCE" ]]; then args+=(--since "$SCAN_SINCE"); fi
           if [[ -n "$OLLAMA_MODEL" ]]; then args+=(--ollama-model "$OLLAMA_MODEL"); fi
-          if npm "${args[@]}" > reports/selection-summary.json 2> reports/selection.log; then
-            jq '{summary, llm}' reports/selection-summary.json
-          else
-            echo '::error::Mail collection or classification failed.'
-            exit 1
-          fi
+          npm "${args[@]}"
       - name: Export ICS
-        run: npm run calendar:ics > reports/ics.log 2>&1
+        run: npm run --silent calendar:ics -- --no-mail-details
       - name: Compare or register Google events
         timeout-minutes: 10
         env:
-          GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
         run: |
           operation=calendar:plan
           if [[ "$APPLY" = true ]]; then operation=calendar:register; fi
-          if npm run --silent "$operation" -- --database \
-            > reports/sync-summary.json 2> reports/sync.log; then
-            jq '{mode, complete, calendarWrites, summary}' reports/sync-summary.json
-          else
-            echo '::error::Google Calendar comparison or registration failed.'
-            exit 1
-          fi
+          npm run --silent "$operation" -- --database --no-mail-details
 
       - name: Dump and encrypt database snapshot
         if: ${{ !cancelled() && steps.load_database.outcome == 'success' }}
         id: dump_database
         env:
-          CALENDAR_DB_PASSPHRASE: ${{ secrets.CALENDAR_DB_PASSPHRASE }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
         run: |
           npm run db:dump
           snapshot=$(<db/dumps/latest.txt)
           mkdir -p "$DB_ARTIFACT_DIR"
           tar -C db/dumps -czf "$RUNNER_TEMP/calendar-db.tar.gz" latest.txt "$snapshot"
-          printf '%s\n' "$CALENDAR_DB_PASSPHRASE" |
+          printf '%s\n' "$GOOGLE_REFRESH_TOKEN" |
             gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --symmetric \
               --cipher-algo AES256 --output "$DB_ARTIFACT_DIR/calendar-db.tar.gz.gpg" "$RUNNER_TEMP/calendar-db.tar.gz"
           rm -f "$RUNNER_TEMP/calendar-db.tar.gz"

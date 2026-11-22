@@ -172,6 +172,7 @@ export async function syncCalendar(
   options: {
     apply: boolean;
     now?: () => Date;
+    mailDetails?: boolean;
     findRegistration?: FindRegistration;
     checkpoint?: (rows: SyncRow[]) => Promise<void>;
   },
@@ -257,9 +258,10 @@ export async function syncCalendar(
         : row.action === 'previously_deleted'
           ? '以前削除された予定のため再登録しない'
           : '既存予定と一致するため重複登録しない';
-    console.error(
-      `${row.shouldRegister ? '登録する' : '登録しない'}: ${mailLabel({ from: selected.sourceFrom ?? '', subject: selected.sourceSubject ?? selected.payload.summary, source: selected.source })} ｜ ${row.reason}`,
-    );
+    if (options.mailDetails !== false)
+      console.error(
+        `${row.shouldRegister ? '登録する' : '登録しない'}: ${mailLabel({ from: selected.sourceFrom ?? '', subject: selected.sourceSubject ?? selected.payload.summary, source: selected.source })} ｜ ${row.reason}`,
+      );
     rows.push(row);
     if (options.checkpoint) await options.checkpoint(rows);
   }
@@ -273,6 +275,7 @@ export async function syncCalendarToFile(
     apply: boolean;
     calendarId: string;
     output: string;
+    mailDetails?: boolean;
     findRegistration?: FindRegistration;
     checkpoint?: (rows: SyncRow[]) => Promise<void>;
   },
@@ -298,6 +301,7 @@ export async function syncCalendarToFile(
   await write([], false);
   const rows = await syncCalendar(selection, port, {
     apply: options.apply,
+    mailDetails: options.mailDetails,
     findRegistration: options.findRegistration,
     checkpoint: async (rows) => {
       await options.checkpoint?.(rows);

@@ -102,7 +102,7 @@ export async function writeDryRun(
   now = new Date(),
   model?: string,
   store?: Store,
-  options: { retryReviews?: boolean } = {},
+  options: { retryReviews?: boolean; mailDetails?: boolean } = {},
 ) {
   const overrides = new Map<number, MailPlan>();
   const llm = {
@@ -133,7 +133,8 @@ export async function writeDryRun(
       const reason = ollamaFailureReason(error);
       if (decision === 'review' && key && store)
         await store.saveExtraction(key, model, { kind: 'review', reason });
-      console.error(`登録しない: ${mailLabel(mail)} ｜ ${reason}`);
+      if (options.mailDetails !== false)
+        console.error(`登録しない: ${mailLabel(mail)} ｜ ${reason}`);
       overrides.set(mail.uid, {
         ...plan,
         decision,
@@ -155,7 +156,7 @@ export async function writeDryRun(
             events: [],
             reasons: [],
           });
-          console.error(`登録しない: ${mailLabel(mail)}`);
+          if (options.mailDetails !== false) console.error(`登録しない: ${mailLabel(mail)}`);
           continue;
         }
         const shortlist = shortlistReason(mail, now);
@@ -172,7 +173,8 @@ export async function writeDryRun(
             events: [],
             reasons: [...plan.reasons, reason],
           });
-          console.error(`登録しない: ${mailLabel(mail)} ｜ ${reason}`);
+          if (options.mailDetails !== false)
+            console.error(`登録しない: ${mailLabel(mail)} ｜ ${reason}`);
           continue;
         }
         checkedModelText(mail);
@@ -198,7 +200,8 @@ export async function writeDryRun(
         }
         llm.uncachedMails++;
         llm.requests++;
-        console.error(`LLM判定対象: ${mailLabel(mail)} ｜ ${shortlist}`);
+        if (options.mailDetails !== false)
+          console.error(`LLM判定対象: ${mailLabel(mail)} ｜ ${shortlist}`);
         const extraction = await extractWithOllama(mail, model);
         await store?.saveExtraction(key, model, extraction);
         applyExtraction(mail, plan, extraction);
