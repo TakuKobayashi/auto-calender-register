@@ -63,6 +63,9 @@ Googleの既存予定は実行ごとに取得します。登録判断は `should
 npm run db:dump
 npm run db:restore
 
+# 既存の古いダンプを削除
+npm run db:prune
+
 # DBの準備と復元
 npm run task db:import
 
@@ -91,7 +94,7 @@ db/dumps/
 ```
 
 各SQLファイルは1レコードにつき1行のINSERT文と、採番シーケンスの復元SQLを含みます。
-`latest.txt` は最新の完了済みスナップショットを指します。復元時はスナップショットのディレクトリも直接指定できます。
+`latest.txt` は最新の完了済みスナップショットを指します。`db:dump` は新しいダンプが完成してから古いダンプを削除します。DB起動中に `npm run db:prune` を実行すると、現在の最新ダンプを検証してから旧ダンプを削除できます。復元時はスナップショットのディレクトリも直接指定できます。
 
 復元前にマイグレーションを適用してください。通常は空DBへ復元し、`--replace` は全7テーブルの既存データを置き換えます。
 復元はテーブル一覧・チェックサムを確認し、1トランザクションで実行します。途中失敗時は全体をロールバックします。
@@ -99,16 +102,15 @@ db/dumps/
 
 ## GitHub Actions
 
-ワークフローは同じ `compose.yml` と `npm run task db:setup` を使用します。
-DB起動 → マイグレーション → SQL復元 → メール選別・照合 → SQLダンプ → DB停止の順に実行します。
+毎回、空のPostgreSQLを起動します。前回のArtifactsがあれば最新の暗号化SQLダンプを復元し、初回は空DBから開始します。新しいダンプのアップロードが成功した後に、古いDBダンプのArtifactsを削除します。
 
-ジョブ間で状態を引き継ぐには、次のステップを保存先に合わせて追加してください。
+SQL一式は **Actions → Mail calendar → 最新のダンプを保存した実行 → Artifacts** にある `mail-calendar-sql-…` からダウンロードできます。ZIPを展開して、Git Bashで次を実行するとテーブル別のSQLを取り出せます。暗号化に使うパスフレーズは `CALENDAR_DB_PASSPHRASE` です。
 
-1. 復元前に保存先から `db/dumps/` を取得する。
-2. ダンプ完了後に `db/dumps/` を保存先へアップロードする。
-
-保存先は未設定です。Runner内のDBとファイルはジョブ終了後に失われます。
-認証情報の設定は [Googleカレンダー連携](google-calendar.md#github-actions) を参照してください。
+```bash
+mkdir -p db/dumps/imported
+gpg --decrypt calendar-db.tar.gz.gpg | tar -xzf - -C db/dumps/imported
+npm run db:restore -- --directory db/dumps/imported
+```
 
 ## 管理コマンド
 

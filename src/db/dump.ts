@@ -1,5 +1,5 @@
-import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
-import { resolve, join } from 'node:path';
+import { mkdir, readFile, writeFile, rename, readdir, realpath, rm } from 'node:fs/promises';
+import { basename, dirname, resolve, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Store } from './store.js';
 import { hash } from './store.js';
@@ -20,14 +20,52 @@ const literal = (value: string | null) =>
     ? 'NULL'
     : `E'${value.replaceAll('\\', '\\\\').replaceAll("'", "''").replaceAll('\r', '\\r').replaceAll('\n', '\\n').replaceAll('\t', '\\t')}'`;
 type Manifest = { version: 1; tables: { name: string; rows: number; checksum: string }[] };
+const snapshotName = /^snapshot-[a-zA-Z0-9-]+$/;
 
 export async function dumpDatabase(store: Store, directory: string) {
-  const unlock = await store.lock('calendar-db:maintenance', true);
+  const unlock = await store.lock('calendar-db:maintenance');
   try {
-    return await dumpSnapshot(store, directory);
+    const result = await dumpSnapshot(store, directory);
+    await removeOldSnapshots(directory, basename(result.directory));
+    return result;
   } finally {
     await unlock();
   }
+}
+
+export async function pruneDatabaseDumps(store: Store, directory: string) {
+  const unlock = await store.lock('calendar-db:maintenance');
+  try {
+    const root = await realpath(directory);
+    const latest = await readLatestSnapshot(root);
+    const latestPath = join(root, latest);
+    if ((await realpath(latestPath)) !== latestPath)
+      throw new Error('ダンプの最新スナップショットが保存先と一致しません。');
+    await readSnapshot(latestPath);
+    return { directory: latestPath, removed: await removeOldSnapshots(root, latest) };
+  } finally {
+    await unlock();
+  }
+}
+
+async function removeOldSnapshots(directory: string, latest: string) {
+  const root = await realpath(directory);
+  const removed = [];
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    if (
+      !entry.isDirectory() ||
+      entry.name === latest ||
+      !snapshotName.test(entry.name.replace(/^\./, ''))
+    )
+      continue;
+    const path = join(root, entry.name);
+    const resolved = await realpath(path);
+    if (resolved !== path || dirname(resolved) !== root)
+      throw new Error('ダンプの削除対象が保存先と一致しません。');
+    await rm(path, { recursive: true });
+    removed.push(entry.name);
+  }
+  return removed;
 }
 
 async function dumpSnapshot(store: Store, directory: string) {
@@ -108,16 +146,13 @@ export async function restoreDatabase(store: Store, directory: string, replace =
   }
 }
 
-async function restoreSnapshot(store: Store, directory: string, replace: boolean) {
-  let root = resolve(directory);
-  try {
-    const snapshot = (await readFile(join(root, 'latest.txt'), 'utf8')).trim();
-    if (!/^snapshot-[a-zA-Z0-9-]+$/.test(snapshot))
-      throw new Error('ダンプのポインターが不正です。');
-    root = join(root, snapshot);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-  }
+async function readLatestSnapshot(root: string) {
+  const latest = (await readFile(join(root, 'latest.txt'), 'utf8')).trim();
+  if (!snapshotName.test(latest)) throw new Error('ダンプのポインターが不正です。');
+  return latest;
+}
+
+async function readSnapshot(root: string) {
   const manifest = JSON.parse(await readFile(join(root, 'manifest.json'), 'utf8')) as Manifest;
   if (
     manifest.version !== 1 ||
@@ -132,6 +167,17 @@ async function restoreSnapshot(store: Store, directory: string, replace: boolean
     if (hash(sql) !== table.checksum) throw new Error(`ダンプのチェックサム不一致: ${table.name}`);
     files.push(sql);
   }
+  return { manifest, files };
+}
+
+async function restoreSnapshot(store: Store, directory: string, replace: boolean) {
+  let root = resolve(directory);
+  try {
+    root = join(root, await readLatestSnapshot(root));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const { manifest, files } = await readSnapshot(root);
   const client = await store.pool.connect();
   try {
     await client.query('BEGIN');

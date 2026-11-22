@@ -36,6 +36,7 @@
     "db:status": "tsx src/db/cli.ts status",
     "db:dump": "tsx src/db/cli.ts dump",
     "db:restore": "tsx src/db/cli.ts restore",
+    "db:prune": "tsx src/db/cli.ts prune",
     "test:db": "tsx --test test/db.integration.ts",
     "db:decisions": "tsx src/db/cli.ts decisions"
   },

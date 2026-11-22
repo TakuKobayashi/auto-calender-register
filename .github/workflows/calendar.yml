@@ -1,21 +1,17 @@
 name: Mail calendar
 
 on:
+  schedule:
+    - cron: '0 */8 * * *'
   workflow_dispatch:
     inputs:
       since:
         description: '受信開始日 YYYY-MM-DD（空欄は先月初日）'
-        required: false
         type: string
       apply:
         description: 'Googleカレンダーへ実際に登録する'
         type: boolean
         default: false
-      calendar_id:
-        description: '登録先カレンダーID（省略時はメインカレンダー）'
-        type: string
-        required: false
-        default: 'primary'
       model:
         description: 'Ollamaモデル（空欄はルール方式のみ）'
         type: string
@@ -23,13 +19,10 @@ on:
       mailbox:
         description: '取得対象フォルダー（複数はカンマ区切り）'
         type: string
-        default: 'INBOX'
-  # 定期実行を始める場合に有効化。schedule時の書き込みは下のREGISTER_ON_SCHEDULEで制御。
-  # schedule:
-  #   - cron: '17 * * * *'
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: mail-calendar
@@ -37,94 +30,210 @@ concurrency:
 
 jobs:
   calendar:
-    runs-on: ubuntu-latest
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
     env:
-      YAHOO_IMAP_USER: ${{ secrets.YAHOO_IMAP_USER }}
-      YAHOO_IMAP_PASSWORD: ${{ secrets.YAHOO_IMAP_PASSWORD }}
-      YAHOO_IMAP_HOST: imap.mail.yahoo.co.jp
-      YAHOO_IMAP_PORT: '993'
-      YAHOO_IMAP_MAILBOX: ${{ vars.YAHOO_IMAP_MAILBOX || 'INBOX' }}
-      GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
-      OLLAMA_MODEL: ${{ inputs.model }}
+      OLLAMA_VERSION: v0.40.16
+      OLLAMA_ARCHIVE_SHA256: 87bfafb2acbc89b2e6a1be0a9043de6aa75fb450696f86bc426e65fc448f788d
+      OLLAMA_MODEL: ${{ github.event_name == 'schedule' && (vars.OLLAMA_MODEL || 'qwen3.5:9b') || inputs.model }}
+      OLLAMA_HOST: 127.0.0.1:11434
       OLLAMA_TIMEOUT_MS: '600000'
       OLLAMA_NUM_PARALLEL: '1'
       OLLAMA_MAX_LOADED_MODELS: '1'
       SCAN_SINCE: ${{ inputs.since }}
-      SCAN_MAILBOX: ${{ inputs.mailbox || 'INBOX' }}
-      APPLY: ${{ inputs.apply }}
-      REGISTER_ON_SCHEDULE: 'false'
+      SCAN_MAILBOX: ${{ inputs.mailbox || vars.YAHOO_IMAP_MAILBOX || 'INBOX' }}
+      APPLY: ${{ github.event_name == 'schedule' || inputs.apply }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Check required secrets
+        env:
+          YAHOO_IMAP_USER: ${{ secrets.YAHOO_IMAP_USER }}
+          YAHOO_IMAP_PASSWORD: ${{ secrets.YAHOO_IMAP_PASSWORD }}
+          GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
+          CALENDAR_DB_PASSPHRASE: ${{ secrets.CALENDAR_DB_PASSPHRASE }}
+        run: |
+          for name in YAHOO_IMAP_USER YAHOO_IMAP_PASSWORD GOOGLE_OAUTH_JSON CALENDAR_DB_PASSPHRASE; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing repository secret: $name"
+              exit 1
+            fi
+          done
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
           cache: npm
       - run: npm ci
-      - name: Set up database with shared Compose
-        id: database
-        run: npm run task db:setup
-      - name: Restore SQL when a snapshot is provided
-        shell: bash
+      - name: Set runner paths
         run: |
-          if [[ -f db/dumps/latest.txt ]]; then npm run db:restore; fi
-      - name: Scheduled model
-        if: github.event_name == 'schedule'
-        run: echo 'OLLAMA_MODEL=qwen3.5:9b' >> "$GITHUB_ENV"
-      - name: Check required secrets
-        shell: bash
+          {
+            echo "DB_ARTIFACT_DIR=$RUNNER_TEMP/calendar-db"
+            echo "OLLAMA_DIR=$RUNNER_TEMP/ollama"
+            echo "OLLAMA_MODELS=$RUNNER_TEMP/ollama/models"
+          } >> "$GITHUB_ENV"
+
+      - name: Find latest SQL artifact
+        id: db_history
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          test -n "$YAHOO_IMAP_USER" && test -n "$YAHOO_IMAP_PASSWORD" && test -n "$GOOGLE_OAUTH_JSON" || {
-            echo 'Required secrets: YAHOO_IMAP_USER, YAHOO_IMAP_PASSWORD, GOOGLE_OAUTH_JSON'
-            exit 1
-          }
-      - name: Cache local model
-        if: env.OLLAMA_MODEL != ''
-        uses: actions/cache@v6
+          artifacts=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" |
+            jq -c --arg branch "$GITHUB_REF_NAME" --argjson repo "$GITHUB_REPOSITORY_ID" \
+              '[.[].artifacts[] |
+                select((.name | test("^mail-calendar-sql-[0-9]+-[0-9]+$")) and
+                  .expired == false and .workflow_run.head_branch == $branch and
+                  .workflow_run.head_repository_id == $repo)] |
+                sort_by(.created_at, .id)')
+          jq -r '"artifact_id=\(last | .id // "")",
+                 "run_id=\(last | .workflow_run.id // "")",
+                 "old_ids=\(map(.id) | join(" "))"' <<< "$artifacts" >> "$GITHUB_OUTPUT"
+      - name: Download latest SQL artifact
+        if: steps.db_history.outputs.artifact_id != ''
+        uses: actions/download-artifact@v8
         with:
-          path: ~/.ollama/models
-          key: ollama-${{ runner.os }}-${{ runner.arch }}-${{ env.OLLAMA_MODEL }}
+          artifact-ids: ${{ steps.db_history.outputs.artifact_id }}
+          run-id: ${{ steps.db_history.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ env.DB_ARTIFACT_DIR }}
+      - name: Set up empty database
+        run: npm run task db:setup
+      - name: Restore SQL snapshot
+        id: load_database
+        env:
+          CALENDAR_DB_PASSPHRASE: ${{ secrets.CALENDAR_DB_PASSPHRASE }}
+          PRIOR_ARTIFACT_ID: ${{ steps.db_history.outputs.artifact_id }}
+        run: |
+          if [[ -z "$PRIOR_ARTIFACT_ID" ]]; then
+            echo 'No previous SQL artifact. Starting with an empty database.'
+            exit 0
+          fi
+          mkdir -p db/dumps
+          printf '%s\n' "$CALENDAR_DB_PASSPHRASE" |
+            gpg --batch --pinentry-mode loopback --passphrase-fd 0 \
+              --decrypt "$DB_ARTIFACT_DIR/calendar-db.tar.gz.gpg" |
+            tar -xzf - -C db/dumps
+          npm run db:restore
+
+      - name: Restore Ollama and model
+        if: env.OLLAMA_MODEL != ''
+        id: ollama_cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.OLLAMA_DIR }}
+          key: ollama-cpu-${{ runner.os }}-${{ runner.arch }}-${{ env.OLLAMA_VERSION }}-${{ env.OLLAMA_MODEL }}
       - name: Start local Ollama
         if: env.OLLAMA_MODEL != ''
-        shell: bash
         run: |
-          curl -fsSL https://ollama.com/install.sh | sh
-          mkdir -p reports
-          ollama serve > reports/ollama.log 2>&1 &
+          ollama="$OLLAMA_DIR/bin/ollama"
+          if [[ ! -x "$ollama" ]]; then
+            mkdir -p "$OLLAMA_DIR"
+            archive="$RUNNER_TEMP/ollama-linux-amd64.tar.zst"
+            curl --fail --silent --show-error --location --retry 3 \
+              "https://github.com/ollama/ollama/releases/download/$OLLAMA_VERSION/ollama-linux-amd64.tar.zst" \
+              --output "$archive"
+            printf '%s  %s\n' "$OLLAMA_ARCHIVE_SHA256" "$archive" | sha256sum --check
+            tar --zstd --exclude='*/ollama/cuda*' --exclude='*/ollama/vulkan*' -xf "$archive" -C "$OLLAMA_DIR"
+            rm -f "$archive"
+          fi
+          "$ollama" serve > "$RUNNER_TEMP/ollama.log" 2>&1 &
           ready=false
           for attempt in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then ready=true; break; fi
+            if curl -fs http://127.0.0.1:11434/api/tags >/dev/null; then
+              ready=true
+              break
+            fi
             sleep 2
           done
-          test "$ready" = true
-          ollama pull "$OLLAMA_MODEL"
+          if [[ "$ready" != true ]]; then
+            cat "$RUNNER_TEMP/ollama.log" >&2
+            exit 1
+          fi
+          if ! "$ollama" show "$OLLAMA_MODEL" >/dev/null 2>&1; then
+            "$ollama" pull "$OLLAMA_MODEL"
+          fi
+      - name: Save Ollama and model
+        if: env.OLLAMA_MODEL != '' && steps.ollama_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.OLLAMA_DIR }}
+          key: ${{ steps.ollama_cache.outputs.cache-primary-key }}
+
       - name: Collect and classify
-        shell: bash
+        timeout-minutes: 95
+        env:
+          YAHOO_IMAP_USER: ${{ secrets.YAHOO_IMAP_USER }}
+          YAHOO_IMAP_PASSWORD: ${{ secrets.YAHOO_IMAP_PASSWORD }}
         run: |
           mkdir -p reports
           args=(run --silent calendar:dry-run -- --database --mailbox "$SCAN_MAILBOX")
           if [[ -n "$SCAN_SINCE" ]]; then args+=(--since "$SCAN_SINCE"); fi
           if [[ -n "$OLLAMA_MODEL" ]]; then args+=(--ollama-model "$OLLAMA_MODEL"); fi
-          npm "${args[@]}" > reports/selection-summary.json
+          if npm "${args[@]}" > reports/selection-summary.json 2> reports/selection.log; then
+            jq '{summary, llm}' reports/selection-summary.json
+          else
+            echo '::error::Mail collection or classification failed.'
+            exit 1
+          fi
       - name: Export ICS
-        run: npm run calendar:ics
+        run: npm run calendar:ics > reports/ics.log 2>&1
       - name: Compare or register Google events
-        shell: bash
+        timeout-minutes: 10
         env:
-          TARGET_CALENDAR_ID: ${{ inputs.calendar_id }}
+          GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
         run: |
           operation=calendar:plan
-          if [[ "$APPLY" = true ]] || [[ "$GITHUB_EVENT_NAME" = schedule && "$REGISTER_ON_SCHEDULE" = true ]]; then
-            operation=calendar:register
+          if [[ "$APPLY" = true ]]; then operation=calendar:register; fi
+          if npm run --silent "$operation" -- --database \
+            > reports/sync-summary.json 2> reports/sync.log; then
+            jq '{mode, complete, calendarWrites, summary}' reports/sync-summary.json
+          else
+            echo '::error::Google Calendar comparison or registration failed.'
+            exit 1
           fi
-          args=(run --silent "$operation" -- --database)
-          if [[ -n "$TARGET_CALENDAR_ID" ]]; then args+=(--calendar-id "$TARGET_CALENDAR_ID"); fi
-          npm "${args[@]}"
-      - name: Dump database as per-table SQL
-        if: always() && steps.database.outcome == 'success'
-        run: npm run db:dump
+
+      - name: Dump and encrypt database snapshot
+        if: ${{ !cancelled() && steps.load_database.outcome == 'success' }}
+        id: dump_database
+        env:
+          CALENDAR_DB_PASSPHRASE: ${{ secrets.CALENDAR_DB_PASSPHRASE }}
+        run: |
+          npm run db:dump
+          snapshot=$(<db/dumps/latest.txt)
+          mkdir -p "$DB_ARTIFACT_DIR"
+          tar -C db/dumps -czf "$RUNNER_TEMP/calendar-db.tar.gz" latest.txt "$snapshot"
+          printf '%s\n' "$CALENDAR_DB_PASSPHRASE" |
+            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --symmetric \
+              --cipher-algo AES256 --output "$DB_ARTIFACT_DIR/calendar-db.tar.gz.gpg" "$RUNNER_TEMP/calendar-db.tar.gz"
+          rm -f "$RUNNER_TEMP/calendar-db.tar.gz"
+      - name: Upload latest SQL artifact
+        id: upload_database
+        if: ${{ !cancelled() && steps.dump_database.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: mail-calendar-sql-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.DB_ARTIFACT_DIR }}/calendar-db.tar.gz.gpg
+          if-no-files-found: error
+          compression-level: 0
+      - name: Delete previous SQL artifacts
+        if: ${{ !cancelled() && steps.upload_database.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_ARTIFACT_ID: ${{ steps.upload_database.outputs.artifact-id }}
+          OLD_ARTIFACT_IDS: ${{ steps.db_history.outputs.old_ids }}
+        run: |
+          [[ "$NEW_ARTIFACT_ID" =~ ^[0-9]+$ ]]
+          read -r -a old_ids <<< "$OLD_ARTIFACT_IDS"
+          for id in "${old_ids[@]}"; do
+            [[ "$id" =~ ^[0-9]+$ ]]
+            if [[ "$id" != "$NEW_ARTIFACT_ID" ]]; then
+              gh api --silent --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
+            fi
+          done
       - name: Stop database
         if: always()
         run: npm run db:down
-      # db/dumps/の永続保存・次回取得は保存先の運用に合わせて設定する。
-      # reports/にはメール本文と予定が含まれるため、公開ログやArtifactsにはアップロードしない。

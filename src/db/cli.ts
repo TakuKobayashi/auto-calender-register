@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { Command } from 'commander';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { Store } from './store.js';
-import { dumpDatabase, restoreDatabase } from './dump.js';
+import { dumpDatabase, pruneDatabaseDumps, restoreDatabase } from './dump.js';
 
 const program = new Command().name('calendar-db');
 const output = (value: unknown) => console.log(JSON.stringify(value, null, 2));
@@ -47,6 +47,11 @@ program
   .option('--directory <path>', 'ダンプ保存先またはスナップショット', 'db/dumps')
   .option('--replace', '既存のアプリ用テーブルの全データを置き換える', false)
   .action((o) => withStore(async (s) => output(await restoreDatabase(s, o.directory, o.replace))));
+program
+  .command('prune')
+  .description('最新のSQLダンプを残して古いスナップショットを削除')
+  .option('--directory <path>', 'ダンプ保存先', 'db/dumps')
+  .action((o) => withStore(async (s) => output(await pruneDatabaseDumps(s, o.directory))));
 try {
   await program.parseAsync();
 } catch (error) {

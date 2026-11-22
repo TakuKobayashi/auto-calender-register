@@ -2,14 +2,14 @@ import 'dotenv/config';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import pg from 'pg';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import type { ImapFlow } from 'imapflow';
 import { Store, mailScope, hash } from '../src/db/store.js';
-import { dumpDatabase, restoreDatabase, dumpTables } from '../src/db/dump.js';
+import { dumpDatabase, pruneDatabaseDumps, restoreDatabase, dumpTables } from '../src/db/dump.js';
 import type { Collection, CollectedMail } from '../src/collect.js';
 import { collectSource } from '../src/collect.js';
 import { collectImapMailbox as collect } from '../src/sources/yahoo.js';
@@ -568,6 +568,26 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
         assert.deepEqual((await store.cachedMails(scope)).get('1'), mail);
       },
     );
+    await t.test('dump and prune keep the latest valid SQL snapshot only', async () => {
+      const root = join(directory, 'prune');
+      const first = await dumpDatabase(store, root);
+      const latest = await dumpDatabase(store, root);
+      await assert.rejects(readFile(join(first.directory, 'manifest.json')), { code: 'ENOENT' });
+      assert.ok(await readFile(join(latest.directory, 'manifest.json')));
+
+      await mkdir(join(root, 'snapshot-old'));
+      await mkdir(join(root, 'other-data'));
+      const table = join(latest.directory, 'mails', 'data.sql');
+      const saved = await readFile(table, 'utf8');
+      await writeFile(table, 'damaged');
+      await assert.rejects(pruneDatabaseDumps(store, root), /チェックサム/);
+      assert.ok((await readdir(root)).includes('snapshot-old'));
+      await writeFile(table, saved);
+
+      assert.deepEqual((await pruneDatabaseDumps(store, root)).removed, ['snapshot-old']);
+      assert.ok((await readdir(root)).includes('other-data'));
+      assert.equal(await readFile(table, 'utf8'), saved);
+    });
   } finally {
     await store.close();
     // This database was created by this test; never use the configured application DB for destructive tests.

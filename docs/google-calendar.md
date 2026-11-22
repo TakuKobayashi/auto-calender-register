@@ -119,28 +119,25 @@ Get-Content -Raw -LiteralPath .secrets/github-google-oauth.json | gh secret set 
 
 GitHubの画面からは「Settings → Secrets and variables → Actions → New repository secret」で登録できます。
 
-| Secret                | 内容                           |
-| --------------------- | ------------------------------ |
-| `YAHOO_IMAP_USER`     | Yahoo! JAPAN ID                |
-| `YAHOO_IMAP_PASSWORD` | Yahoo!メールのIMAP用パスワード |
-| `GOOGLE_OAUTH_JSON`   | OAuth認証JSON全体              |
+| Secret                   | 内容                                         |
+| ------------------------ | -------------------------------------------- |
+| `YAHOO_IMAP_USER`        | Yahoo! JAPAN ID                              |
+| `YAHOO_IMAP_PASSWORD`    | Yahoo!メールのIMAP用パスワード               |
+| `GOOGLE_OAUTH_JSON`      | OAuth認証JSON全体                            |
+| `CALENDAR_DB_PASSPHRASE` | DBダンプ暗号化用のランダムな長いパスフレーズ |
 
 他の実行環境でも `GOOGLE_OAUTH_JSON` にJSON文字列を渡せます。
 認証情報の読み込み順は、JSON環境変数 → `GOOGLE_CLIENT_ID`・`GOOGLE_CLIENT_SECRET`・`GOOGLE_REFRESH_TOKEN` → ローカル認証ファイルです。
 
-[calendar.yml](../.github/workflows/calendar.yml) は手動実行に対応しています。
+[calendar.yml](../.github/workflows/calendar.yml) はデフォルトブランチで毎日 **01:00・09:00・17:00（日本時間）** にメールを確認し、確定予定を登録します。手動確認は **Actions → Mail calendar → Run workflow** から実行できます。
 
-| 入力          | 内容                                                |
-| ------------- | --------------------------------------------------- |
-| `since`       | 受信開始日                                          |
-| `apply`       | `true` で登録、既定は `false`（照合のみ）           |
-| `calendar_id` | 登録先。既定は `primary`                            |
-| `model`       | Ollamaモデル。既定は `qwen3.5:9b`、空欄はルール方式 |
-| `mailbox`     | 対象フォルダー。複数はカンマ区切り、既定は `INBOX`  |
+| 入力      | 内容                                                                            |
+| --------- | ------------------------------------------------------------------------------- |
+| `since`   | 受信開始日                                                                      |
+| `apply`   | `true` で登録、既定は `false`（照合のみ）                                       |
+| `model`   | Ollamaモデル。既定は `qwen3.5:9b`、空欄はルール方式                             |
+| `mailbox` | 対象フォルダー。省略時はリポジトリ変数 `YAHOO_IMAP_MAILBOX`、未設定なら `INBOX` |
 
-定期実行はワークフローの `schedule` を有効にします。
-定期実行でも登録する場合は `REGISTER_ON_SCHEDULE` を `true` に設定してください。
-定期実行のモデルは `qwen3.5:9b` です。
+定期実行のモデルはリポジトリ変数 `OLLAMA_MODEL` で変更できます。既定は `qwen3.5:9b` です。Ollama本体・モデル・npmのダウンロードを再利用します。
 
-ジョブの上限は120分、LLMの待ち時間は1メール600秒です。
-DBの引き継ぎには [SQLダンプの保存先設定](database.md#github-actions) が必要です。
+登録先は認証したGoogleアカウントのメインカレンダーです。SQLダンプの確認・取得は [Artifactsのダウンロード手順](database.md#github-actions) を参照してください。
