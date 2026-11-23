@@ -1,7 +1,13 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { DateTime } from 'luxon';
-import { classifyAll, type MailPlan, type EventPlan } from './classify.js';
+import {
+  classifyAll,
+  classifyMail,
+  calendarEvents,
+  type MailPlan,
+  type EventPlan,
+} from './classify.js';
 import type { Collection } from './collect.js';
 import {
   extractWithOllama,
@@ -22,7 +28,6 @@ import { finalize } from './classify.js';
 import { mailLabel, sourceScope } from './domain/mail.js';
 import { inspectDatePresence } from './date-presence.js';
 import { shortlistReason } from './mail-shortlist.js';
-import { filterCalendarMails } from './mail-exclusions.js';
 import type { CollectedMail } from './domain/mail.js';
 
 type ExistingEvent = {
@@ -109,7 +114,6 @@ export async function writeDryRun(
   const llm = {
     skippedNoDate: 0,
     skippedByShortlist: 0,
-    skippedOptionalMail: 0,
     cacheHits: 0,
     requests: 0,
     uncachedMails: 0,
@@ -126,21 +130,31 @@ export async function writeDryRun(
   };
   if (progressOnly) logProgress(0);
   if (model) {
-    const initial = classifyAll(collection.messages, now);
-    const filterErrors = new Map<CollectedMail, unknown>();
-    const candidates = new Set(
-      filterCalendarMails(collection.messages, (mail, error) => filterErrors.set(mail, error)),
-    );
-    const applyExtraction = (mail: CollectedMail, plan: MailPlan, extraction: Extraction) => {
-      const inferred = extractionToPlan(mail, extraction, now, finalize);
-      overrides.set(mail.uid, reconcileModelPlan(plan, inferred));
+    const applyExtraction = (mail: CollectedMail, extraction: Extraction) => {
+      const calendar = calendarEvents(mail, now);
+      const plan = extractionToPlan(mail, extraction, now, (event, date) => {
+        const matches = calendar.filter(
+          (item) => item.start && event.start && Date.parse(item.start) === Date.parse(event.start),
+        );
+        const original = matches.length === 1 ? matches[0] : undefined;
+        if (original?.identity) {
+          event.identity = original.identity;
+          event.sequence = original.sequence;
+        }
+        return finalize(event, date);
+      });
+      overrides.set(mail.uid, plan);
     };
-    const recordFailure = async (
-      mail: CollectedMail,
-      plan: MailPlan,
-      error: unknown,
-      key?: string,
-    ) => {
+    const emptyPlan = ({ uid, source, subject, from, messageId, receivedAt }: CollectedMail) => ({
+      uid,
+      source,
+      subject,
+      from,
+      messageId,
+      receivedAt,
+      events: [],
+    });
+    const recordFailure = async (mail: CollectedMail, error: unknown, key?: string) => {
       const timedOut = error instanceof OllamaTimeoutError;
       const cacheReview = error instanceof OllamaError && error.needsReview;
       const decision = timedOut || cacheReview ? 'review' : 'error';
@@ -151,53 +165,38 @@ export async function writeDryRun(
       if (options.mailDetails !== false)
         console.error(`登録しない: ${mailLabel(mail)} ｜ ${reason}`);
       overrides.set(mail.uid, {
-        ...plan,
+        ...emptyPlan(mail),
         decision,
-        events: [],
-        reasons: [...plan.reasons, reason, '自動登録しない'],
+        reasons: [reason, '自動登録しない'],
       });
     };
-    const reuseExtraction = async (mail: CollectedMail, plan: MailPlan, key: string) => {
+    const reuseExtraction = async (mail: CollectedMail, key: string) => {
       const cached = await store?.getExtraction(key);
       if (!cached || (isReviewOutcome(cached) && options.retryReviews)) return false;
       llm.cacheHits++;
       if (isReviewOutcome(cached)) {
         overrides.set(mail.uid, {
-          ...plan,
+          ...emptyPlan(mail),
           decision: 'review',
-          events: [],
           reasons: [
-            ...plan.reasons,
             cached.reason,
             '入力・モデルが同じため保存済みの要確認結果を使用。自動登録しない',
           ],
         });
       } else {
-        applyExtraction(mail, plan, validateExtraction(cached));
+        applyExtraction(mail, validateExtraction(cached));
       }
       return true;
     };
-    const pending: { mail: CollectedMail; plan: MailPlan; key: string; shortlist: string }[] = [];
+    const pending: { mail: CollectedMail; key: string; shortlist: string }[] = [];
     for (let i = 0; i < total; i++) {
       if (progressOnly && i > 0 && i % 25 === 0) logProgress(i - pending.length);
       const mail = collection.messages[i]!;
-      const plan = initial[i]!;
       let key: string | undefined;
       try {
-        if (filterErrors.has(mail)) throw filterErrors.get(mail);
-        if (!candidates.has(mail)) {
-          llm.skippedOptionalMail++;
-          overrides.set(mail.uid, {
-            ...plan,
-            decision: 'excluded',
-            events: [],
-            reasons: [],
-          });
-          if (options.mailDetails !== false) console.error(`登録しない: ${mailLabel(mail)}`);
-          continue;
-        }
         const shortlist = shortlistReason(mail, now);
         if (!shortlist) {
+          const plan = classifyMail(mail, now);
           const presence = inspectDatePresence(mail);
           if (presence.hasDate) llm.skippedByShortlist++;
           else llm.skippedNoDate++;
@@ -216,9 +215,9 @@ export async function writeDryRun(
         }
         checkedModelText(mail);
         key = extractionCacheKey(mail, model, await localModelDigest(model));
-        if (!(await reuseExtraction(mail, plan, key))) pending.push({ mail, plan, key, shortlist });
+        if (!(await reuseExtraction(mail, key))) pending.push({ mail, key, shortlist });
       } catch (error) {
-        await recordFailure(mail, plan, error, key);
+        await recordFailure(mail, error, key);
       }
     }
     if (progressOnly && pending.length)
@@ -233,21 +232,21 @@ export async function writeDryRun(
       return Number.isFinite(sent) ? sent : -Infinity;
     };
     pending.sort((a, b) => receivedTime(b.mail) - receivedTime(a.mail));
-    for (const [index, { mail, plan, key, shortlist }] of pending.entries()) {
+    for (const [index, { mail, key, shortlist }] of pending.entries()) {
       const processed = total - pending.length + index;
       try {
         // A preceding request in this run may have saved an identical input.
-        if (!(await reuseExtraction(mail, plan, key))) {
+        if (!(await reuseExtraction(mail, key))) {
           llm.uncachedMails++;
           llm.requests++;
           if (progressOnly) logProgress(processed, true);
           else console.error(`LLM判定対象: ${mailLabel(mail)} ｜ ${shortlist}`);
           const extraction = await extractWithOllama(mail, model);
           await store?.saveExtraction(key, model, extraction);
-          applyExtraction(mail, plan, extraction);
+          applyExtraction(mail, extraction);
         }
       } catch (error) {
-        await recordFailure(mail, plan, error, key);
+        await recordFailure(mail, error, key);
       }
       if (progressOnly && processed + 1 < total) logProgress(processed + 1);
     }
@@ -331,7 +330,7 @@ export async function writeDryRun(
     `既存カレンダー照合: ${existingFile ? 'ローカルスナップショットのみ（最新性は未保証）' : '未接続・未確認。候補は登録確定ではありません。'}`,
     '',
     `確認メール ${plans.length}件 / 登録候補 ${proposed.length}件 / 登録しない ${plans.filter((p) => !p.shouldRegister).length}件 / 処理エラー ${counts.error}件`,
-    `新規LLM判定 ${llm.uncachedMails}通 / LLM呼び出し ${llm.requests}回 / キャッシュ利用 ${llm.cacheHits}通 / 販促・一般案内等で省略 ${llm.skippedOptionalMail}件 / 日付なしで省略 ${llm.skippedNoDate}件 / 今後の日時候補なしで省略 ${llm.skippedByShortlist}件`,
+    `新規LLM判定 ${llm.uncachedMails}通 / LLM呼び出し ${llm.requests}回 / キャッシュ利用 ${llm.cacheHits}通 / 日付なしで省略 ${llm.skippedNoDate}件 / 今後の日時候補なしで省略 ${llm.skippedByShortlist}件`,
     '',
     '## 登録候補',
     '',
@@ -368,69 +367,4 @@ export async function writeDryRun(
       );
   }
   return report;
-}
-
-export function reconcileModelPlan(rule: MailPlan, inferred: MailPlan): MailPlan {
-  const merged = {
-    ...inferred,
-    source: rule.source,
-    bookingIds: [...new Set([...(rule.bookingIds ?? []), ...(inferred.bookingIds ?? [])])],
-    cancelled: rule.cancelled || ['cancelled', 'completed'].includes(inferred.intent ?? ''),
-  };
-  if (rule.decision === 'pending' || inferred.decision === 'pending') {
-    return {
-      ...merged,
-      decision: 'pending',
-      events: [],
-      reasons: [...rule.reasons, ...inferred.reasons, '未確定の根拠を優先。確定通知まで登録しない'],
-    };
-  }
-  const candidates = rule.events.filter((e) => e.decision === 'candidate');
-  if (
-    rule.decision === 'candidate' &&
-    inferred.intent === 'confirmed' &&
-    candidates.length &&
-    candidates.every((e) =>
-      inferred.events.some(
-        (other) =>
-          other.start && e.start && new Date(other.start).getTime() === new Date(e.start).getTime(),
-      ),
-    )
-  ) {
-    const retained = structuredClone(rule);
-    retained.bookingIds = merged.bookingIds;
-    retained.intent = 'confirmed';
-    for (const event of retained.events) {
-      if (!event.payload || !event.start) continue;
-      const extracted = inferred.events.find(
-        (other) =>
-          other.payload && other.start && Date.parse(other.start) === Date.parse(event.start!),
-      );
-      if (!extracted?.payload) continue;
-      event.title = extracted.title;
-      event.payload.summary = extracted.payload.summary;
-      event.calendarDetails = extracted.calendarDetails;
-      event.payload.description = extracted.payload.description;
-    }
-    retained.reasons.push(
-      ...inferred.reasons,
-      '本人の確定予定とLLMが判断。日時は既存ルールの検証済み情報を使用',
-    );
-    return retained;
-  }
-  if (rule.decision === 'candidate' && !['candidate', 'duplicate'].includes(inferred.decision)) {
-    const events = structuredClone(rule.events);
-    for (const event of events) {
-      event.decision = 'review';
-      delete event.payload;
-      event.reasons.push('予約ルールとLLMが不一致。自動登録しない');
-    }
-    return {
-      ...merged,
-      decision: 'review',
-      events,
-      reasons: [...rule.reasons, ...inferred.reasons],
-    };
-  }
-  return merged;
 }

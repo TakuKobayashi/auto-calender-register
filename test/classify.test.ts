@@ -184,6 +184,39 @@ test('同じ予約番号の後続キャンセルを本文予定にも反映', ()
   assert.equal(plans[0]?.events[0]?.payload, undefined);
 });
 
+test('同じ予約と日時の後続メールに検証漏れがあっても確定済みの候補を保持する', () => {
+  const first = mail({ text: '受付番号:ABC12345\n' + mail().text });
+  const second = mail({ uid: 11, receivedAt: '2026-10-11T00:00:00Z' });
+  const confirmed = classifyAll([first], now)[0]!;
+  const event = confirmed.events[0]!;
+  event.identity = JSON.stringify([confirmed.bookingIds, 'appointment', event.start]);
+  const reminder = {
+    ...confirmed,
+    uid: second.uid,
+    receivedAt: second.receivedAt,
+    decision: 'review' as const,
+    events: [{ ...event, title: '予約の詳細', decision: 'review' as const, payload: undefined }],
+  };
+  const run = () =>
+    classifyAll(
+      [first, second],
+      now,
+      new Map([
+        [first.uid, confirmed],
+        [second.uid, reminder],
+      ]),
+    );
+  assert.deepEqual(
+    run().map((plan) => plan.decision),
+    ['candidate', 'duplicate'],
+  );
+  reminder.events[0]!.end = '2026-11-30T21:30:00+09:00';
+  assert.deepEqual(
+    run().map((plan) => plan.decision),
+    ['duplicate', 'review'],
+  );
+});
+
 test('住所省略のリマインダーは予約番号と予定名・現地日時で元メールと照合', () => {
   const plans = classifyAll(
     [

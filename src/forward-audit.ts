@@ -13,7 +13,6 @@ import {
   unwrapForward,
   type Extraction,
 } from './ollama.js';
-import { reconcileModelPlan } from './dry-run.js';
 import { mailLabel } from './domain/mail.js';
 
 export type ForwardCache = {
@@ -153,8 +152,6 @@ export async function auditForwards(
         extraction?: Extraction;
         current?: ReturnType<typeof extractionToPlan>;
         atForwardTime?: ReturnType<typeof extractionToPlan>;
-        hybridCurrent?: ReturnType<typeof reconcileModelPlan>;
-        hybridAtForwardTime?: ReturnType<typeof reconcileModelPlan>;
         error?: string;
         elapsedMs: number;
       },
@@ -187,8 +184,6 @@ export async function auditForwards(
           ),
           elapsedMs: Date.now() - begin,
         };
-        row.llm.hybridCurrent = reconcileModelPlan(current, row.llm.current!);
-        row.llm.hybridAtForwardTime = reconcileModelPlan(historical, row.llm.atForwardTime!);
         await writeFile(inferenceCachePath, JSON.stringify(inferenceCache, null, 2), {
           mode: 0o600,
         });
@@ -228,11 +223,11 @@ export async function auditForwards(
     report.note,
     '過去の旅行を現在の登録候補から除くことと、予定の抽出に失敗することは別です。転送時点の判定も併記します。',
     '',
-    '| Sent UID | 件名 | 原本INBOX UID | ルール・転送時点 | ルール・現在 | LLM意図 | 統合・転送時点 | 統合・現在 |',
+    '| Sent UID | 件名 | 原本INBOX UID | ルール・転送時点 | ルール・現在 | LLM意図 | LLM・転送時点 | LLM・現在 |',
     '|---|---|---|---|---|---|---|---|',
     ...rows.map(
       (r) =>
-        `| ${r.sentUid} | ${escape(r.subject)} | ${r.originalInboxUids.join(', ') || 'キャッシュ内に一意の原本なし'} | ${r.rulesAtForwardTime.decision} | ${r.currentRules.decision} | ${r.llm?.extraction?.intent ?? (r.llm?.error ? 'error' : '未評価')} | ${r.llm?.hybridAtForwardTime?.decision ?? '—'} | ${r.llm?.hybridCurrent?.decision ?? '—'} |`,
+        `| ${r.sentUid} | ${escape(r.subject)} | ${r.originalInboxUids.join(', ') || 'キャッシュ内に一意の原本なし'} | ${r.rulesAtForwardTime.decision} | ${r.currentRules.decision} | ${r.llm?.extraction?.intent ?? (r.llm?.error ? 'error' : '未評価')} | ${r.llm?.atForwardTime?.decision ?? '—'} | ${r.llm?.current?.decision ?? '—'} |`,
     ),
     '',
     '詳しい根拠・推論エラーは forward-audit.json にあります。Googleカレンダーへの書き込みはありません。',

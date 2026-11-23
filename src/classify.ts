@@ -4,6 +4,7 @@ import { DateTime, FixedOffsetZone } from 'luxon';
 import * as ical from 'node-ical';
 import type { CollectedMail } from './domain/mail.js';
 import { mailLabel, type MessageSource } from './domain/mail.js';
+import { hasJapaneseAddress } from './address.js';
 
 export type Decision = 'candidate' | 'review' | 'excluded' | 'duplicate' | 'error' | 'pending';
 export type EventPlan = {
@@ -171,7 +172,7 @@ export function finalize(plan: EventPlan, now: Date): EventPlan {
   return plan;
 }
 
-function calendarEvents(mail: CollectedMail, now: Date): EventPlan[] {
+export function calendarEvents(mail: CollectedMail, now: Date): EventPlan[] {
   const plans: EventPlan[] = [];
   for (const source of mail.calendarParts ?? []) {
     const parsed = ical.sync.parseICS(source);
@@ -286,12 +287,7 @@ function textEvents(mail: CollectedMail, now: Date): EventPlan[] {
       localBlock.match(/(?:開催場所|会場|場所)\s*[:：]\s*([^\n]+)/)?.[1]?.trim() ??
       '';
     let zone = zoneFromText(localBlock) ?? zoneFromText(prepared);
-    if (
-      !zone &&
-      /(?:東京都|北海道|(?:大阪|京都)府|神奈川県|千葉県|埼玉県|[^\s]{2,3}県)[^\n]*(?:市|区|町|村)/.test(
-        location,
-      )
-    ) {
+    if (!zone && hasJapaneseAddress(location)) {
       zone = { zone: 'Asia/Tokyo', reason: '予定の会場住所が日本国内' };
     }
     const offset = result.start.isCertain('timezoneOffset')
@@ -516,10 +512,22 @@ export function classifyAll(
         new Date(b.plan.receivedAt ?? 0).getTime() - new Date(a.plan.receivedAt ?? 0).getTime() ||
         b.plan.uid - a.plan.uid,
     );
-    for (const older of group.slice(1)) {
+    const latest = group[0]!;
+    const cancelled = latest.plan.cancelled || latest.event.cancelled;
+    let preferred = latest;
+    if (!cancelled && latest.event.decision === 'review') {
+      const confirmed = group.find(
+        ({ plan, event }) =>
+          event.decision === 'candidate' &&
+          (plan.intent === 'confirmed' || sameBookingTime(event, latest.event)),
+      );
+      preferred = confirmed ?? latest;
+    }
+    for (const older of group) {
+      if (older === preferred) continue;
       older.event.decision = 'duplicate';
       delete older.event.payload;
-      older.event.reasons.push(`同一予定の最新通知: ${mailLabel(group[0]!.plan)}`);
+      older.event.reasons.push(`同一予定の採用通知: ${mailLabel(preferred.plan)}`);
     }
   }
   // 同一事業者の予約番号に後続のキャンセル・変更があれば古い登録案を止める。
@@ -536,31 +544,29 @@ export function classifyAll(
         (a, b) => Date.parse(b.receivedAt ?? '') - Date.parse(a.receivedAt ?? '') || b.uid - a.uid,
       )[0];
       if (!latest) continue;
+      const sameNotification = (notification: EventPlan) => {
+        if (sameBookingTime(event, notification)) return true;
+        if (notification.title !== event.title) return false;
+        if (!notification.localStart || notification.localStart !== event.localStart) return false;
+        if (notification.timeZone && notification.timeZone !== event.timeZone) return false;
+        if (notification.end && notification.end !== event.end) return false;
+        return true;
+      };
       if (latest.cancelled) {
         event.decision = 'excluded';
         event.reasons.push(`後続通知で取消・受取完了: ${mailLabel(latest)}`);
         delete event.payload;
-      } else if (
-        latest.events.some(
-          (e) =>
-            e.title === event.title &&
-            e.localStart &&
-            e.localStart === event.localStart &&
-            (!e.timeZone || e.timeZone === event.timeZone),
-        )
-      ) {
+      } else if (latest.events.some(sameNotification)) {
         // リマインダーに住所が省略されても、元の予約番号・科目・現地日時が一致すれば同じ予定。
-        event.reasons.push(
-          `後続通知でも同じ予約番号・予定名・現地開始日時を確認: ${mailLabel(latest)}`,
-        );
-        for (const other of latest.events.filter(
-          (e) => e.title === event.title && e.localStart === event.localStart,
-        )) {
+        event.reasons.push(`後続通知でも同じ予約と日時を確認: ${mailLabel(latest)}`);
+        for (const other of latest.events.filter(sameNotification)) {
+          if (other.decision === 'duplicate') continue;
           other.decision = 'duplicate';
           delete other.payload;
           other.reasons.push(`詳細情報のあるメールと同じ予約の通知: ${mailLabel(plan)}`);
         }
       } else if (
+        plan.intent !== 'confirmed' &&
         !latest.events.some((e) => e.start === event.start && e.decision === 'candidate')
       ) {
         event.decision = 'review';
@@ -582,4 +588,12 @@ export function classifyAll(
     }
   }
   return plans;
+}
+
+function sameBookingTime(original: EventPlan, notification: EventPlan) {
+  const { identity, start, end } = original;
+  if (!identity || !start || !end) return false;
+  return (
+    identity === notification.identity && start === notification.start && end === notification.end
+  );
 }

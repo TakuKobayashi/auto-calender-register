@@ -1,10 +1,8 @@
-import { DateTime } from 'luxon';
-import * as chrono from 'chrono-node';
+import { DateTime, IANAZone } from 'luxon';
 import type { CollectedMail } from './domain/mail.js';
 import type { EventPlan, MailPlan } from './classify.js';
 import { createHash } from 'node:crypto';
 import { convert } from 'html-to-text';
-import { zoneSupported } from './time-zones.js';
 
 export class OllamaError extends Error {
   constructor(
@@ -524,57 +522,21 @@ function quoteExists(text: string, quote: string) {
   return quote.length >= 3 && normalize(text).includes(normalize(quote));
 }
 
-function alignQuote(text: string, quote: string, pattern?: RegExp) {
-  if (quoteExists(text, quote)) return quote;
-  // モデルが離れた複数行を結合して引用した場合、実在する連続した行だけに限定する。
-  // ない単語を補完したり、本文の別の場所から根拠を捏造したりはしない。
-  return (
-    quote
-      .split(/[\r\n]+/)
-      .map((s) => s.trim())
-      .find((s) => s.length >= 8 && (!pattern || pattern.test(s)) && quoteExists(text, s)) ?? quote
-  );
+function parseEventDate(value: string | null, zone: string | null) {
+  if (!value || !zone || !IANAZone.isValidZone(zone)) return null;
+  const match = /^(\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?)?)(Z|[+-]\d{2}:\d{2})?$/.exec(value);
+  if (!match) return null;
+  const local = match[1]!;
+  const offset = match[2];
+  if (offset && local.length === 10) return null;
+  const date = DateTime.fromISO(local, { zone });
+  if (!date.isValid || !date.toISO()?.startsWith(local)) return null;
+  const possibleDates = date.getPossibleOffsets();
+  if (!offset) return possibleDates.length === 1 ? date : null;
+  const instant = DateTime.fromISO(value).toMillis();
+  return possibleDates.find((option) => option.toMillis() === instant) ?? null;
 }
 
-export function dateSupported(local: string | null, evidence: string, reference: Date) {
-  if (!local) return false;
-  const target = DateTime.fromISO(local, { zone: 'UTC', setZone: true });
-  if (!target.isValid) return false;
-  const normalized = evidence
-    .normalize('NFKC')
-    .replace(/(日)[ \t]*\([月火水木金土日](?:[・、]?(?:祝|振休))?\)/g, '$1 ')
-    .replace(/\s+/g, ' ');
-  const dates = [
-    ...chrono.ja.parse(normalized, reference),
-    ...chrono.en.parse(normalized, reference),
-  ];
-  const matchingDate = dates.some(
-    (r) =>
-      (r.start.isCertain('year') ||
-        (target.diff(DateTime.fromJSDate(reference, { zone: 'UTC' }), 'days').days >= -1 &&
-          target.diff(DateTime.fromJSDate(reference, { zone: 'UTC' }), 'days').days <= 93)) &&
-      r.start.isCertain('month') &&
-      r.start.isCertain('day') &&
-      (r.start.isCertain('year')
-        ? r.start.get('year') === target.year
-        : [reference.getUTCFullYear(), reference.getUTCFullYear() + 1].includes(target.year)) &&
-      r.start.get('month') === target.month &&
-      r.start.get('day') === target.day,
-  );
-  const matchingTime =
-    dates.some(
-      (r) =>
-        r.start.isCertain('hour') &&
-        r.start.get('hour') === target.hour &&
-        (r.start.get('minute') ?? 0) === target.minute,
-    ) ||
-    [...normalized.matchAll(/(?:^|[^\d])(\d{1,2})[:時](\d{2})?(?:分)?/g)].some(
-      (m) => Number(m[1]) === target.hour && Number(m[2] ?? 0) === target.minute,
-    );
-  return matchingDate && (local.length === 10 || matchingTime);
-}
-
-// 国や都市からの推定を無制限に許さず、実例で検証する地域だけに限定。
 export function extractionToPlan(
   mail: CollectedMail,
   extraction: Extraction,
@@ -605,16 +567,6 @@ export function extractionToPlan(
           }:${ref.toUpperCase()}`,
       ),
   };
-  if (
-    /予約はまだ確定ではありません|予約は未確定|キャンセル待ち|waitlist/i.test(
-      `${unwrapForward(mail).subject}\n${text.slice(0, 2000)}`,
-    )
-  ) {
-    base.intent = 'pending';
-    base.decision = 'pending';
-    base.reasons.push('本文に明示された未確定状態を優先');
-    return base;
-  }
   if (['marketing', 'not_event', 'cancelled', 'completed'].includes(extraction.intent)) {
     base.decision = 'excluded';
     return base;
@@ -625,80 +577,23 @@ export function extractionToPlan(
     return base;
   }
   for (const e of extraction.events) {
-    const startEvidence = alignQuote(text, e.startEvidence);
-    const endEvidence = alignQuote(text, e.endEvidence);
-    const zoneEvidence = alignQuote(text, e.zoneEvidence);
-    const confirmationEvidence = alignQuote(
-      text,
-      e.confirmationEvidence,
-      /確定|予約確認|confirmed|confirmation|申込完了|申し込み|発券|ticket/i,
-    );
-    const reasons: string[] = ['ローカルLLM抽出。本文の引用と日時をプログラムで再検証'];
+    const reasons: string[] = ['ローカルLLM抽出'];
     let eligible = extraction.intent === 'confirmed';
-    for (const [name, quote] of [
-      ['開始', startEvidence],
-      ...(e.endLocal ? [['終了', endEvidence]] : []),
-      ['タイムゾーン', zoneEvidence],
-      ['参加確定', confirmationEvidence],
-    ]) {
-      if (!quoteExists(text, quote!)) {
-        eligible = false;
-        reasons.push(`${name}の原文引用を確認できない`);
-      }
-    }
-    const parse = (value: string | null, zone: string | null) => {
-      if (
-        !value ||
-        !zone ||
-        !/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?)?$/.test(value)
-      )
-        return null;
-      const date = DateTime.fromISO(value.slice(0, 19), { zone });
-      if (
-        /(?:Z|[+-]\d{2}:\d{2})$/.test(value) &&
-        DateTime.fromISO(value, { setZone: true }).offset !== date.offset
-      )
-        return null;
-      if (
-        !date.isValid ||
-        (value.length > 10 && date.toFormat("yyyy-MM-dd'T'HH:mm") !== value.slice(0, 16)) ||
-        date.getPossibleOffsets().length !== 1
-      )
-        return null;
-      // モデルの地理知識を盲信しない。引用に対象都市またはIANAの明示が必要。
-      if (!zoneSupported(zone, zoneEvidence)) return null;
-      return date;
-    };
-    // Some models encode an unspecified clock as midnight. Only normalize it
-    // when the source proves the date and contains no clock at all.
-    const effectiveStart =
-      e.startLocal &&
-      /T00:00(?::00)?$/.test(e.startLocal) &&
-      !/[0-9０-９]{1,2}\s*[:：時]/.test(startEvidence) &&
-      dateSupported(
-        e.startLocal.slice(0, 10),
-        startEvidence,
-        new Date(mail.date ?? mail.receivedAt ?? now),
-      )
-        ? e.startLocal.slice(0, 10)
-        : e.startLocal;
-    const reference = new Date(mail.date ?? mail.receivedAt ?? now);
     const notificationStart =
       e.startBasis === 'notification' &&
       e.kind === 'deadline' &&
       e.startLocal === null &&
       e.endLocal?.length === 10 &&
       e.startZone &&
-      quoteExists(text, startEvidence) &&
-      zoneSupported(e.startZone, zoneEvidence)
-        ? DateTime.fromJSDate(new Date(mail.date ?? mail.receivedAt ?? ''), {
-            zone: e.startZone,
-          }).startOf('day')
+      IANAZone.isValidZone(e.startZone)
+        ? DateTime.fromISO(mail.date ?? mail.receivedAt ?? '', { zone: e.startZone }).startOf('day')
         : null;
     const start =
-      e.startBasis === 'notification' ? notificationStart : parse(effectiveStart, e.startZone);
-    const allDay = Boolean(notificationStart) || effectiveStart?.length === 10;
-    const endInText = e.endLocal ? parse(e.endLocal, e.endZone ?? e.startZone) : null;
+      e.startBasis === 'notification'
+        ? notificationStart
+        : parseEventDate(e.startLocal, e.startZone);
+    const allDay = Boolean(notificationStart) || e.startLocal?.length === 10;
+    const endInText = parseEventDate(e.endLocal, e.endZone ?? e.startZone);
     const end = e.endLocal
       ? allDay && e.endLocal.length === 10
         ? (endInText?.plus({ days: 1 }) ?? null)
@@ -711,49 +606,37 @@ export function extractionToPlan(
           ? '時刻未記載のため終日表示'
           : '終了時刻未記載。15分枠は開始通知用で実際の所要時間ではありません',
       );
-    if (!notificationStart?.isValid && !dateSupported(effectiveStart, startEvidence, reference)) {
-      eligible = false;
-      reasons.push('開始の年月日・時刻が引用した原文と一致しない');
-    }
-    const duration = endEvidence.normalize('NFKC').match(/(\d+)\s*(?:分|minutes?)/i)?.[1];
-    const calculatedEnd =
-      start &&
-      end &&
-      duration &&
-      start.plus({ minutes: Number(duration) }).toMillis() === end.toMillis();
-    if (e.endLocal && !dateSupported(e.endLocal, endEvidence, reference) && !calculatedEnd) {
-      eligible = false;
-      reasons.push('終了の年月日・時刻または所要時間を原文から検証できない');
-    }
     if (!start?.isValid) {
       eligible = false;
       reasons.push('開始日時・タイムゾーンを確定できない');
     }
-    if (!end) {
+    if (!end?.isValid) {
       eligible = false;
       reasons.push('終了日時・タイムゾーンを確定できない');
+    }
+    if (
+      allDay &&
+      endInText &&
+      (e.endLocal?.length !== 10 || endInText.zoneName !== start?.zoneName)
+    ) {
+      eligible = false;
+      reasons.push('終日予定の終了日には開始日と同じタイムゾーンの日付が必要');
     }
     if (start && end && end <= start) {
       eligible = false;
       reasons.push('終了が開始以前');
     }
-    if (e.location && !quoteExists(text, e.location)) {
-      eligible = false;
-      reasons.push('予定の場所を原文で確認できない');
-    }
-    const notes =
-      e.calendarNotes ??
-      (e.calendarDetails ?? []).map((detail) => ({ text: detail, evidence: detail }));
+    const location = quoteExists(text, e.location) ? e.location : '';
+    const notes = e.calendarNotes?.map((note) => note.text) ?? e.calendarDetails ?? [];
     const calendarDetails: string[] = [];
     const seenDetails = new Set<string>();
     for (const note of notes) {
-      const detail = note.text.replace(/\s+/g, ' ').trim();
+      const detail = note.replace(/\s+/g, ' ').trim();
       const normalized = detail.normalize('NFKC');
       const key = normalized.toLowerCase().replace(/\s+/g, '');
       if (
         !key ||
         seenDetails.has(key) ||
-        !quoteExists(text, note.evidence) ||
         /https?:\/\/|\[URL\]|認証コード|受(?:け)?取(?:り)?コード|暗証番号|パスワード|QRコード|\b(?:PIN|passcode|password|access code)\b/i.test(
           normalized,
         ) ||
@@ -785,12 +668,12 @@ export function extractionToPlan(
         localStart: e.startLocal ?? undefined,
         timeZone: start?.zoneName ?? null,
         endTimeZone: end?.zoneName ?? null,
-        location: e.location,
+        location,
         evidence: [
-          startEvidence,
-          endEvidence,
-          zoneEvidence,
-          confirmationEvidence,
+          e.startEvidence,
+          e.endEvidence,
+          e.zoneEvidence,
+          e.confirmationEvidence,
           ...(extraction.references ?? [])
             .filter((ref) => quoteExists(text, ref))
             .map((ref) => `参照番号: ${ref}`),

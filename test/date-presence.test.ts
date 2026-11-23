@@ -7,7 +7,6 @@ import type { CollectedMail, Collection } from '../src/collect.js';
 import { inspectDatePresence } from '../src/date-presence.js';
 import { writeDryRun } from '../src/dry-run.js';
 import { shortlistReason } from '../src/mail-shortlist.js';
-import { filterCalendarMails } from '../src/mail-exclusions.js';
 
 function mail(text: string, overrides: Partial<CollectedMail> = {}): CollectedMail {
   return {
@@ -149,44 +148,7 @@ test('事前選別は定型フッターだけの日付を省略し、本文・�
   );
 });
 
-test('同じ除外パターンを件名にも本文にも適用する', () => {
-  const sale = '期間限定セールは11月25日まで';
-  const appointment = mail('11月25日14時の面談が確定しました。');
-  const candidates = filterCalendarMails([mail('', { subject: sale }), appointment, mail(sale)]);
-  assert.deepEqual(candidates, [appointment]);
-});
-
-test('販促の表現が一つでもあれば候補から外す', () => {
-  const promotions = [
-    'クーポンコードは11月25日まで有効です。',
-    '11月25日開催のおすすめイベント情報',
-    '11月25日までご応募いただけます。メールマガジンの配信停止はこちら。',
-    'ご予約番号: TEST123456。無料トライアルは11月25日まで。',
-    'Concerts are now on sale until November 25.',
-  ];
-  assert.deepEqual(filterCalendarMails(promotions.map((text) => mail(text))), []);
-});
-
-test('価格や期限を含む確定予定と本人の対応期限を残す', () => {
-  const mails = [
-    mail('お荷物を11月25日までにお受け取りください。期限を過ぎると返送します。'),
-    mail('合計金額は1,500円です。支払日: 2026年12月1日', {
-      subject: '領収書のお知らせ',
-    }),
-    mail('サービス終了日の11月25日までにデータをダウンロードしてください。'),
-    mail('11月25日開催。参加が確定しました。参加費は無料です。'),
-  ];
-  assert.deepEqual(filterCalendarMails(mails), mails);
-});
-
-test('ICS付きのメールは販促語のチェックで候補から外さない', () => {
-  const invite = mail('期間限定セールのお知らせ', {
-    calendarParts: ['BEGIN:VCALENDAR'],
-  });
-  assert.deepEqual(filterCalendarMails([invite]), [invite]);
-});
-
-test('日時候補がないメールや販促メールはモデルを呼ばない', async (t) => {
+test('日時候補がないメールや過去の日付のみのメールはモデルを呼ばない', async (t) => {
   t.mock.method(globalThis, 'fetch', async () => {
     throw new Error('Ollamaを呼んではいけません');
   });
@@ -197,15 +159,11 @@ test('日時候補がないメールや販促メールはモデルを呼ばな�
     uidValidity: '1',
     since: '2026-10-01T00:00:00Z',
     collectedAt: '2026-11-18T00:00:00Z',
-    matched: 3,
+    matched: 2,
     complete: true,
     messages: [
       mail('商品情報のお知らせです'),
       mail('2026年11月15日 12:00に行われました。', { uid: 2 }),
-      mail('11月25日まで全品割引。配信停止は設定から行えます。', {
-        uid: 3,
-        subject: '期間限定セール',
-      }),
     ],
     errors: [],
   };
@@ -222,13 +180,9 @@ test('日時候補がないメールや販促メールはモデルを呼ばな�
   assert.match(report.messages[0]!.reasons.join(' '), /日付情報なし/);
   assert.equal(report.messages[1]!.shouldRegister, false);
   assert.match(report.messages[1]!.reasons.join(' '), /今後の日時候補を確認できない/);
-  assert.equal(report.messages[2]!.shouldRegister, false);
-  assert.equal(report.messages[2]!.decision, 'excluded');
-  assert.deepEqual(report.messages[2]!.reasons, []);
   assert.deepEqual(report.llm, {
     skippedNoDate: 1,
     skippedByShortlist: 1,
-    skippedOptionalMail: 1,
     cacheHits: 0,
     requests: 0,
     uncachedMails: 0,

@@ -41,7 +41,6 @@
     "db:decisions": "tsx src/db/cli.ts decisions"
   },
   "dependencies": {
-    "@vvo/tzdb": "^6.204.0",
     "chrono-node": "^2.10.3",
     "commander": "^15.1.0",
     "dotenv": "^18.0.10",

@@ -6,7 +6,6 @@ import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  dateSupported,
   extractionCacheKey,
   localModelDigest,
   extractionToPlan,
@@ -16,7 +15,7 @@ import {
   type Extraction,
 } from '../src/ollama.js';
 import { filterGmailForwards, matchOriginal } from '../src/forward-audit.js';
-import { reconcileModelPlan, writeDryRun } from '../src/dry-run.js';
+import { writeDryRun } from '../src/dry-run.js';
 import type { Store } from '../src/db/store.js';
 import { validateSelection } from '../src/selection.js';
 
@@ -189,14 +188,6 @@ test('転送の外側の引用だけを除き、元メールの過去返信引�
   assert.doesNotMatch(modelText(forwarded), /古い引用/);
 });
 
-test('転送された事実を確定根拠にしない。LLMが確定と言っても明示の未確定を優先', () => {
-  const pending = mail({ text: '予約はまだ確定ではありません。\n' + mail().text });
-  assert.equal(classifyMail(pending, now).decision, 'pending');
-  const result = extractionToPlan(pending, extraction(), now, finalize);
-  assert.equal(result.decision, 'pending');
-  assert.equal(result.events.length, 0);
-});
-
 test('pendingからconfirmedの通知が来たときだけ候補にできる', () => {
   assert.equal(
     extractionToPlan(mail(), extraction({ intent: 'pending' }), now, finalize).decision,
@@ -205,7 +196,7 @@ test('pendingからconfirmedの通知が来たときだけ候補にできる', (
   assert.equal(extractionToPlan(mail(), extraction(), now, finalize).decision, 'candidate');
 });
 
-test('予定日時・会場・確定の引用が正しければ登録用payloadを生成', () => {
+test('LLMの予定データから登録用payloadを生成し、認証情報を本文から除く', () => {
   const original = mail();
   const modelResult = extraction();
   modelResult.events[0]!.calendarDetails = [
@@ -222,10 +213,10 @@ test('予定日時・会場・確定の引用が正しければ登録用payload�
   assert.equal(result.events[0]?.payload?.start.dateTime, '2026-11-20T15:00:00.000+09:00');
   assert.equal(result.events[0]?.payload?.end.dateTime, '2026-11-21T10:00:00.000+09:00');
   const description = result.events[0]!.payload!.description;
-  assert.equal(description, '受付で身分証を提示してください。');
+  assert.equal(description, '受付で身分証を提示してください。\n朝食は無料です。');
 });
 
-test('メールは1通ずつ判定し、カレンダー本文には原文にある実用情報だけを載せる', async (t) => {
+test('メールは1通ずつ判定し、LLMの要約をカレンダー本文に使う', async (t) => {
   const hotel = mail({
     text:
       mail().text + '\n予約番号: 1793129809 (支払済: ¥6,402)\n施設連絡先: frontdesk@example.com',
@@ -291,14 +282,9 @@ test('メールは1通ずつ判定し、カレンダー本文には原文にあ�
       '予約ID：1793129809（支払済 ¥6,402）',
       'チェックイン：11/20 15:00',
       '施設連絡先：frontdesk@example.com',
+      '朝食付き',
     ].join('\n'),
   );
-});
-
-test('モデルが日付を捏造しても原文との照合で保留', () => {
-  const e = extraction();
-  e.events[0]!.startLocal = '2026-11-22T15:00:00';
-  assert.equal(extractionToPlan(mail(), e, now, finalize).decision, 'review');
 });
 
 test('オンライン予定には元メールの参加相手と会議リンクを載せる', () => {
@@ -352,26 +338,6 @@ test('オンライン予定には元メールの参加相手と会議リンク�
   assert.equal(ambiguousEvent.payload?.description, '11/20 15:00–15:45（日本時間）');
 });
 
-test('IANA名だけを引用したふりにしても本文に存在しなければ保留', () => {
-  const e = extraction();
-  e.events[0]!.zoneEvidence = 'Asia/Tokyo';
-  assert.equal(extractionToPlan(mail(), e, now, finalize).decision, 'review');
-});
-
-test('海外の都市を引用して日本時間を出力しても保留', () => {
-  const e = extraction();
-  e.events[0]!.zoneEvidence = '所在地:プラハ';
-  assert.equal(
-    extractionToPlan(
-      mail({ text: mail().text.replace('所在地:東京都港区1-1-1', '所在地:プラハ') }),
-      e,
-      now,
-      finalize,
-    ).decision,
-    'review',
-  );
-});
-
 test('過去の予定を正しく抽出できても現在の登録候補にはしない', () => {
   assert.equal(
     extractionToPlan(mail(), extraction(), new Date('2026-12-01T00:00:00Z'), finalize).decision,
@@ -393,16 +359,6 @@ test('不正なモデル出力を拒否', () => {
     assert.throws(() => validateExtraction(value));
 });
 
-test('原文の時刻と年月日を検証し、年の勝手な補完を拒否', () => {
-  assert.equal(dateSupported('2026-11-20T15:00:00', '2026年11月20日 15:00', now), true);
-  assert.equal(dateSupported('2027-11-20T15:00:00', '2026年11月20日 15:00', now), false);
-  assert.equal(dateSupported('2026-11-20T15:00:00', '11月20日 15:00', now), true);
-});
-
-test('日付の次行の括弧内に書かれた時刻を捨てない', () => {
-  assert.equal(dateSupported('2026-11-20T15:00:00', '2026年11月20日\n\n(15:00以降)', now), true);
-});
-
 test('日時に付いたオフセットは会場のタイムゾーンと一致するときだけ許可', () => {
   const e = extraction();
   e.events[0]!.startLocal += '+09:00';
@@ -412,33 +368,83 @@ test('日時に付いたオフセットは会場のタイムゾーンと一致�
   assert.equal(extractionToPlan(mail(), e, now, finalize).decision, 'review');
 });
 
-test('ルールの確定候補をLLMが営業と言った場合、黙って除外せず矛盾として保留', () => {
-  const rule = extractionToPlan(mail(), extraction(), now, finalize);
-  const inferred = extractionToPlan(mail(), extraction({ intent: 'marketing' }), now, finalize);
-  const merged = reconcileModelPlan(rule, inferred);
-  assert.equal(merged.decision, 'review');
-  assert.equal(merged.events[0]?.payload, undefined);
+test('不正な日付、存在しないタイムゾーン、開始以前の終了は登録候補にしない', () => {
+  for (const overrides of [
+    { startLocal: '2026-11-31T15:00:00' },
+    { startZone: 'Asia/Invalid' },
+    { endLocal: '2026-11-20T14:00:00' },
+  ]) {
+    const e = extraction();
+    Object.assign(e.events[0]!, overrides);
+    assert.equal(extractionToPlan(mail(), e, now, finalize).decision, 'review');
+  }
 });
 
-test('LLMも確定と判断し開始日時が一致するとき、ルールで検証済みの終了日時を維持', () => {
-  const rule = extractionToPlan(mail(), extraction(), now, finalize);
-  const partial = extraction();
-  partial.events[0]!.endLocal = null;
-  partial.events[0]!.calendarNotes = [
-    { text: 'チェックイン：11/20 15:00', evidence: 'チェックイン:2026年11月20日 15:00' },
-  ];
-  const inferred = extractionToPlan(mail(), partial, now, finalize);
-  assert.equal(inferred.decision, 'candidate');
-  const merged = reconcileModelPlan(rule, inferred);
-  assert.equal(merged.decision, 'candidate');
-  assert.equal(merged.events[0]?.payload?.end.dateTime, '2026-11-21T10:00:00.000+09:00');
-  assert.equal(merged.events[0]?.payload?.description, 'チェックイン：11/20 15:00');
-});
-
-test('LLMが場所を捏造した場合も自動登録しない', () => {
+test('場所が空欄か原文と一致しなくても日時を確認できれば登録候補に残す', () => {
   const e = extraction();
-  e.events[0]!.location = '架空のホテル';
-  assert.equal(extractionToPlan(mail(), e, now, finalize).decision, 'review');
+  for (const location of ['', '架空のホテル']) {
+    e.events[0]!.location = location;
+    const result = extractionToPlan(mail(), e, now, finalize);
+    assert.equal(result.decision, 'candidate');
+    assert.equal(result.events[0]?.payload?.location, '');
+  }
+});
+
+test('通常の選別で本文ルールが異なる結果を出してもLLMの判定と予定を採用する', async (t) => {
+  const confirmed = mail({
+    subject: 'キャンセル待ちから予約が確定しました',
+    text: ['予約番号:ABC12345', mail().text, '配信停止はこちら'].join('\n'),
+  });
+  const promotion = mail({ uid: 2, subject: '期間限定セール', text: '2026年11月20日まで全品割引' });
+  const reminder = mail({
+    uid: 3,
+    receivedAt: '2026-10-03T00:00:00Z',
+    subject: 'ご利用案内',
+    text: '予約番号:ABC12345\n受付で予約番号を提示してください。',
+  });
+  assert.equal(classifyMail(confirmed, now).decision, 'pending');
+  const confirmedExtraction = extraction({ references: ['ABC12345'] });
+  Object.assign(confirmedExtraction.events[0]!, {
+    title: 'LLMが選んだ予約名',
+    startEvidence: '',
+    endEvidence: '',
+    zoneEvidence: '',
+    confirmationEvidence: '',
+    endLocal: '2026-11-21T11:00:00',
+  });
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).endsWith('/api/tags'))
+      return Response.json({ models: [{ name: 'marketing-test', digest: 'a'.repeat(64) }] });
+    if (String(input).endsWith('/api/show')) return Response.json({ details: { format: 'gguf' } });
+    const request = JSON.parse(String(init?.body));
+    const { subject } = JSON.parse(request.messages.at(-1).content);
+    const result =
+      subject === promotion.subject
+        ? extraction({ intent: 'marketing', events: [] })
+        : confirmedExtraction;
+    return new Response(
+      JSON.stringify({ message: { content: JSON.stringify(result) }, done: true }) + '\n',
+    );
+  });
+  const directory = await mkdtemp(join(tmpdir(), 'calendar-marketing-'));
+  const input = {
+    ...collection(confirmed),
+    messages: [confirmed, promotion, reminder],
+    matched: 3,
+  };
+  const report = await writeDryRun(input, directory, undefined, now, 'marketing-test', undefined, {
+    mailDetails: false,
+  });
+  assert.equal(report.complete, true);
+  assert.equal(report.llm.requests, 2);
+  assert.deepEqual(
+    report.proposed.map((event) => event.sourceUid),
+    [confirmed.uid],
+  );
+  const [selected] = validateSelection(report, now).events;
+  assert.equal(selected?.payload.summary, 'LLMが選んだ予約名');
+  assert.equal(selected?.payload.end.dateTime, '2026-11-21T11:00:00.000+09:00');
+  assert.equal(report.messages.find((plan) => plan.uid === promotion.uid)?.decision, 'excluded');
 });
 
 test('転送先が複数ならユーザー指定なしで混同しない', () => {
