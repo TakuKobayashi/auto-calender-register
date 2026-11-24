@@ -167,6 +167,7 @@ jobs:
           key: ${{ steps.ollama_cache.outputs.cache-primary-key }}
 
       - name: Collect and classify
+        id: selection
         timeout-minutes: 271
         env:
           YAHOO_IMAP_USER: ${{ secrets.YAHOO_IMAP_USER }}
@@ -174,16 +175,22 @@ jobs:
         run: |
           args=(run --silent calendar:dry-run -- --database --no-mail-details --mailbox "$SCAN_MAILBOX")
           if [[ -n "$SCAN_SINCE" ]]; then args+=(--since "$SCAN_SINCE"); fi
-          if [[ -n "$OLLAMA_MODEL" ]]; then args+=(--ollama-model "$OLLAMA_MODEL"); fi
+          if [[ -n "$OLLAMA_MODEL" ]]; then
+            args+=(--ollama-model "$OLLAMA_MODEL" --llm-budget-seconds 15000)
+          fi
           status=0
           timeout --kill-after=10s 270m npm "${args[@]}" || status=$?
           if [[ "$status" = 124 || "$status" = 137 ]]; then
             echo '::error::メールの取得・選別が制限時間に達しました。保存済みの進捗をSQLに出力します。'
           fi
-          exit "$status"
+          if [[ "$status" != 0 ]]; then exit "$status"; fi
+          jq -er 'if .complete then "complete=true" elif .remainingLlm > 0 then "complete=false" else error("Invalid selection result") end' \
+            reports/dry-run.json >> "$GITHUB_OUTPUT"
       - name: Export ICS
+        if: steps.selection.outputs.complete == 'true'
         run: npm run --silent calendar:ics -- --no-mail-details
       - name: Compare or register Google events
+        if: steps.selection.outputs.complete == 'true'
         timeout-minutes: 10
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}

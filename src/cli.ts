@@ -130,11 +130,21 @@ program
   )
   .option('--ollama-model <name>', 'ローカルOllamaで文脈を再判定（実験機能・モデル指定必須）')
   .option('--retry-reviews', 'LLM出力上限等で保存した要確認結果を再推論する', false)
+  .option(
+    '--llm-budget-seconds <seconds>',
+    '新規LLM判定を開始できる実行時間（秒）',
+    positiveInteger,
+  )
   .option('--no-mail-details', 'コンソールにメールや予定の詳細を表示しない')
   .option('--database', 'PostgreSQLへ進捗・抽出結果を保存（既定で有効）', true)
   .option('--no-database', 'DBを使わずJSONのみ保存')
   .action(async (options) =>
     withTracking(options.database, async (store) => {
+      if (options.llmBudgetSeconds && (!store || !options.ollamaModel))
+        throw new Error('--llm-budget-seconds にはDBとOllamaが必要です。');
+      const llmDeadline = options.llmBudgetSeconds
+        ? Date.now() + options.llmBudgetSeconds * 1000
+        : undefined;
       const unlock = await store?.lock(`mail:${mailAccount().provider}:${mailAccount().key}`);
       let runId: number | undefined;
       try {
@@ -181,11 +191,14 @@ program
           new Date(),
           options.ollamaModel,
           store,
-          { retryReviews: options.retryReviews, mailDetails: options.mailDetails },
+          { retryReviews: options.retryReviews, mailDetails: options.mailDetails, llmDeadline },
         );
+        const paused = report.remainingLlm > 0 && collection.complete && report.summary.error === 0;
         output({
           mode: report.mode,
           complete: report.complete,
+          paused,
+          remainingLlm: report.remainingLlm,
           calendarWrites: 0,
           calendarDuplicateCheck: report.calendarDuplicateCheck,
           summary: {
@@ -209,7 +222,9 @@ program
               }
             : {}),
         });
-        if (!report.complete) {
+        if (paused) {
+          console.error(`LLM判定待ち ${report.remainingLlm}件。判定済みの結果は次回再利用します。`);
+        } else if (!report.complete) {
           console.error(
             `メール選別が未完了のため停止しました。取得・解析エラー ${report.summary.error}件。詳細: ${options.outputDir}/dry-run.md`,
           );
@@ -219,7 +234,14 @@ program
           process.exitCode = 2;
         }
         if (store && runId)
-          await store.finishRun(runId, report.complete ? 'completed' : 'error', report.summary);
+          await store.finishRun(
+            runId,
+            paused ? 'paused' : report.complete ? 'completed' : 'error',
+            {
+              ...report.summary,
+              remainingLlm: report.remainingLlm,
+            },
+          );
       } catch (error) {
         if (store && runId)
           await store.finishRun(runId, 'error', { message: 'メール取得・選別失敗' });

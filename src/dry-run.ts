@@ -97,9 +97,10 @@ export async function writeDryRun(
   now = new Date(),
   model?: string,
   store?: Store,
-  options: { retryReviews?: boolean; mailDetails?: boolean } = {},
+  options: { retryReviews?: boolean; mailDetails?: boolean; llmDeadline?: number } = {},
 ) {
   const overrides = new Map<number, MailPlan>();
+  let remainingLlm = 0;
   const llm = {
     skippedNoDate: 0,
     skippedByShortlist: 0,
@@ -226,6 +227,10 @@ export async function writeDryRun(
       try {
         // A preceding request in this run may have saved an identical input.
         if (!(await reuseExtraction(mail, key))) {
+          if (options.llmDeadline !== undefined && Date.now() >= options.llmDeadline) {
+            remainingLlm = pending.length - index;
+            break;
+          }
           llm.uncachedMails++;
           llm.requests++;
           if (progressOnly) logProgress(processed, true);
@@ -240,8 +245,11 @@ export async function writeDryRun(
       if (progressOnly && processed + 1 < total) logProgress(processed + 1);
     }
   }
-  const plans = classifyAll(collection.messages, now, overrides);
-  if (progressOnly && total) logProgress(total);
+  const processed = remainingLlm
+    ? collection.messages.filter((mail) => overrides.has(mail.uid))
+    : collection.messages;
+  const plans = classifyAll(processed, now, overrides);
+  if (progressOnly && total) logProgress(processed.length);
   if (existingFile) {
     const raw = JSON.parse(await readFile(existingFile, 'utf8'));
     const existing: ExistingCalendarEvent[] = Array.isArray(raw) ? raw : raw.items;
@@ -296,7 +304,12 @@ export async function writeDryRun(
     uidValidity: collection.uidValidity,
     sourceScope: collection.sourceScope,
     mailCollectedAt: collection.collectedAt,
-    complete: collection.complete && counts.error === 0 && plans.length === collection.matched,
+    complete:
+      collection.complete &&
+      remainingLlm === 0 &&
+      counts.error === 0 &&
+      plans.length === collection.matched,
+    remainingLlm,
     calendarDuplicateCheck: existingFile ? 'local_snapshot_only' : 'not_connected',
     calendarWrites: 0,
     summary: {

@@ -117,6 +117,54 @@ test('個別のLLMタイムアウトだけを次回に再試行し、判定済�
   assert.deepEqual(calls, [timedOutMail.subject, confirmedMail.subject, timedOutMail.subject]);
 });
 
+test('実行時間で区切っても、次回は保存済み結果を再利用して残りだけ判定する', async (t) => {
+  const model = 'resume-budget-test';
+  const digest = 'e'.repeat(64);
+  const first = mail();
+  const second = mail({ uid: 2, subject: '別の予約確認' });
+  const stored = new Map([[extractionCacheKey(first, model, digest), extraction()]]);
+  const calls = t.mock.method(globalThis, 'fetch', async (url: string) => {
+    if (url.endsWith('/api/tags')) return Response.json({ models: [{ name: model, digest }] });
+    if (url.endsWith('/api/show')) return Response.json({ details: { format: 'gguf' } });
+    return new Response(
+      JSON.stringify({ message: { content: JSON.stringify(extraction()) }, done: true }) + '\n',
+    );
+  });
+  const store = {
+    getExtraction: async (key: string) => stored.get(key),
+    saveExtraction: async (key: string, _model: string, result: Extraction) =>
+      stored.set(key, result),
+  } as unknown as Store;
+  const input = { ...collection(first), messages: [first, second], matched: 2 };
+  const directory = await mkdtemp(join(tmpdir(), 'calendar-resume-budget-'));
+  const run = (llmDeadline?: number) =>
+    writeDryRun(input, directory, undefined, now, model, store, {
+      llmDeadline,
+      mailDetails: false,
+    });
+  const paused = await run(0);
+  assert.equal(paused.complete, false);
+  assert.equal(paused.remainingLlm, 1);
+  assert.equal(paused.summary.scanned, 1);
+  assert.equal(paused.llm.cacheHits, 1);
+  assert.equal(paused.llm.requests, 0);
+  assert.throws(() => validateSelection(paused, now));
+
+  const completed = await run();
+  assert.equal(completed.complete, true);
+  assert.equal(completed.remainingLlm, 0);
+  assert.equal(completed.llm.cacheHits, 1);
+  assert.equal(completed.llm.requests, 1);
+  assert.equal(stored.size, 2);
+  const cached = await run(0);
+  assert.equal(cached.complete, true);
+  assert.equal(cached.llm.cacheHits, 2);
+  assert.equal(
+    calls.mock.calls.filter((call) => String(call.arguments[0]).endsWith('/api/chat')).length,
+    1,
+  );
+});
+
 test('モデル更新でdigestが変われば、同じモデル名とメールでも抽出キャッシュを更新する', () => {
   const original = extractionCacheKey(mail(), 'model', 'a'.repeat(64));
   assert.equal(extractionCacheKey(mail({ flags: ['\\Seen'] }), 'model', 'a'.repeat(64)), original);
