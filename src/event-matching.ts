@@ -1,108 +1,170 @@
-import { DateTime } from 'luxon';
 import type { ExistingCalendarEvent } from './domain/calendar.js';
-import type { SelectedEvent } from './selection.js';
-import { googleEventId } from './selection.js';
+import { googleEventId, type SelectedEvent } from './selection.js';
 
 export type Match = {
-  kind: 'duplicate' | 'possible_duplicate' | 'previously_deleted';
+  kind: 'duplicate' | 'previously_deleted';
   event: ExistingCalendarEvent;
   reason: string;
 };
-export function normalizedTitle(value: string) {
+
+const points = {
+  title: 45,
+  description: 60,
+  start: 20,
+  nearbyStart: 12,
+  end: 10,
+  location: 10,
+  reference: 60,
+  differentDescription: -25,
+  differentLocation: -15,
+};
+const duplicateThreshold = 65;
+const minimumContentPointsForReference = 20;
+const nearbyStartMs = 15 * 60_000;
+const labeledReferencePattern =
+  /\b\d{3}-\d{7}-\d{7}\b|(?:(?:参照|受付|予約|注文)[ \t]*(?:番号|ID)|booking[ \t]*(?:id|reference))[ \t]*[:#：＃]?[ \t]*([A-Z0-9][A-Z0-9-]{3,})/gi;
+
+function normalizeText(value: string) {
   return value
     .normalize('NFKC')
     .toLowerCase()
-    .replace(/^(?:(?:fw|fwd|re)\s*:\s*)+/i, '')
-    .replace(/\((?:\d+分|受験開始|開始)\)/g, '')
-    .replace(/[\s\p{P}\p{S}]/gu, '');
+    .replace(/[^\p{L}\p{N}]/gu, '');
 }
+
+function normalizedTitle(value: string) {
+  return normalizeText(
+    value
+      .normalize('NFKC')
+      .replace(/^(?:(?:fw|fwd|re)\s*:\s*)+/i, '')
+      .replace(/\((?:\d+分|受験開始|開始)\)/g, ''),
+  );
+}
+
 function references(event: { summary?: string; description?: string }) {
   const text = `${event.summary ?? ''}\n${event.description ?? ''}`.normalize('NFKC');
   return new Set(
-    [
-      ...text.matchAll(
-        /\b\d{3}-\d{7}-\d{7}\b|(?:参照番号|受付番号|予約番号|注文番号|booking\s*(?:id|reference))\s*[:：#]?\s*([A-Z0-9][A-Z0-9-]{5,})/gi,
-      ),
-    ].map((m) => (m[1] ?? m[0]).toUpperCase()),
+    [...text.matchAll(labeledReferencePattern)].map((m) => (m[1] ?? m[0]).toUpperCase()),
   );
 }
-function similarity(a: string, b: string) {
+
+function normalizedDescription(value: string, location: string) {
+  const description = normalizeText(
+    value
+      .normalize('NFKC')
+      .replace(/<[^>]+>|https?:\/\/[^\s<]+/gi, ' ')
+      .replace(labeledReferencePattern, ' ')
+      .replace(
+        /(?:\d{4}年)?\d{1,2}月\d{1,2}日|\b(?:\d{4}[-/.])?\d{1,2}[-/.]\d{1,2}\b|\b\d{1,2}:\d{2}(?::\d{2})?\b|\d{1,2}時(?:\d{1,2}分)?/g,
+        ' ',
+      ),
+  );
+  return location.length >= 4 ? description.replaceAll(location, '') : description;
+}
+
+function trigrams(text: string) {
+  const chars = Array.from(text);
+  const result = new Set<string>();
+  for (let index = 2; index < chars.length; index++) {
+    result.add(chars.slice(index - 2, index + 1).join(''));
+  }
+  return result;
+}
+
+function similarity(a: string, b: string, { allowPartial = false } = {}) {
   if (!a || !b) return 0;
   if (a === b) return 1;
-  const grams = (s: string) =>
-    new Set(Array.from({ length: Math.max(0, s.length - 1) }, (_, i) => s.slice(i, i + 2)));
-  const x = grams(a),
-    y = grams(b);
-  return [...x].filter((g) => y.has(g)).length / Math.max(1, new Set([...x, ...y]).size);
+  const first = trigrams(a);
+  const second = trigrams(b);
+  if (!first.size || !second.size) return 0;
+  const shared = [...first].filter((gram) => second.has(gram)).length;
+  if (allowPartial && shared >= 6) return shared / Math.min(first.size, second.size);
+  return (2 * shared) / (first.size + second.size);
 }
+
+function locationScore(location: string, otherLocation: string, title: string, otherTitle: string) {
+  if (!location || !otherLocation) return 0;
+  if (similarity(location, otherLocation) >= 0.85) return points.location;
+  const venueNameInBothTitles = [location, otherLocation].some(
+    (place) => place.length >= 4 && title.includes(place) && otherTitle.includes(place),
+  );
+  return venueNameInBothTitles ? 0 : points.differentLocation;
+}
+
 export function matchExisting(
   selected: SelectedEvent,
   existing: ExistingCalendarEvent[],
 ): Match | null {
+  const id = googleEventId(selected.eventKey);
   const start = Date.parse(selected.payload.start.dateTime);
-  const day =
-    selected.payload.allDayDate ??
-    DateTime.fromISO(selected.payload.start.dateTime, { setZone: true }).toISODate();
+  const end = Date.parse(selected.payload.end.dateTime);
+  const day = selected.payload.allDayDate;
   const title = normalizedTitle(selected.payload.summary);
-  const location = selected.payload.location.normalize('NFKC').replace(/\s/g, '');
+  const location = normalizeText(selected.payload.location);
+  const description = normalizedDescription(selected.payload.description, location);
   const refs = references(selected.payload);
-  let possible: Match | null = null;
+  let exactReferenceMatch: Match | undefined;
+  let best: { event: ExistingCalendarEvent; score: number } | undefined;
+
   for (const event of existing) {
     if (
-      event.id === googleEventId(selected.eventKey) ||
+      event.id === id ||
       event.extendedProperties?.private?.sourceEventKey === selected.eventKey ||
       event.iCalUID === selected.iCalUID
-    )
+    ) {
       return {
         kind: event.status === 'cancelled' ? 'previously_deleted' : 'duplicate',
         event,
         reason: '予定ID・予定キー・ICS UIDの一致',
       };
-    if (event.status === 'cancelled') continue;
+    }
+    if (event.status === 'cancelled' || exactReferenceMatch) continue;
+
+    const otherDay = event.start?.date;
+    if (day !== otherDay) continue;
+    const difference = day ? 0 : Math.abs(start - Date.parse(event.start?.dateTime ?? ''));
+    if (!Number.isFinite(difference) || difference > nearbyStartMs) continue;
+
     const otherRefs = references(event);
     const sharedReference = [...refs].some((ref) => otherRefs.has(ref));
     if (refs.size && otherRefs.size && !sharedReference) continue;
-    const otherStart = event.start?.dateTime ? Date.parse(event.start.dateTime) : NaN;
-    const otherDay =
-      event.start?.date ??
-      (event.start?.dateTime
-        ? DateTime.fromISO(event.start.dateTime)
-            .setZone(selected.payload.start.timeZone ?? 'UTC')
-            .toISODate()
-        : null);
-    const sameDay = day === otherDay;
+
+    const sameEnd = day
+      ? selected.payload.end.dateTime.slice(0, 10) === event.end?.date
+      : end === Date.parse(event.end?.dateTime ?? '');
+    if (sharedReference && difference === 0 && sameEnd) {
+      exactReferenceMatch = {
+        kind: 'duplicate',
+        event,
+        reason: '予約・受付・注文番号と開始・終了日時が一致',
+      };
+      continue;
+    }
+
     const otherTitle = normalizedTitle(event.summary ?? '');
-    const score = similarity(title, otherTitle);
-    const similarTitle =
-      (title.length > 0 && title === otherTitle) ||
-      (title.length >= 4 &&
-        otherTitle.length >= 4 &&
-        (score >= 0.65 || title.includes(otherTitle) || otherTitle.includes(title)));
-    const sameLocation =
-      !!location && location === event.location?.normalize('NFKC').replace(/\s/g, '');
-    if (sharedReference && sameDay)
-      return { kind: 'duplicate', event, reason: '同じ予約・注文番号と予定日が一致' };
-    if (otherStart === start && title && title === otherTitle)
-      return { kind: 'duplicate', event, reason: '正規化した予定名と開始時刻が一致' };
-    if (otherStart === start)
-      possible = {
-        kind: 'possible_duplicate',
-        event,
-        reason:
-          '同じ開始時刻の既存予定があり、別の予定と確定できないため重複防止を優先して登録しない',
-      };
-    if (selected.payload.allDayDate && sameDay && (similarTitle || sharedReference))
-      return { kind: 'duplicate', event, reason: '予定日と予定名・参照番号が一致' };
-    if (
-      (Math.abs(otherStart - start) <= 15 * 60_000 &&
-        (similarTitle || (sameLocation && score >= 0.35))) ||
-      (event.start?.date === day && similarTitle)
-    )
-      possible = {
-        kind: 'possible_duplicate',
-        event,
-        reason: '同じ日に類似する既存予定があるため重複防止を優先して登録しない',
-      };
+    const otherLocation = normalizeText(event.location ?? '');
+    const otherDescription = normalizedDescription(event.description ?? '', otherLocation);
+    let contentScore = points.title * similarity(title, otherTitle, { allowPartial: true });
+    if (description.length >= 12 && otherDescription.length >= 12) {
+      const overlap = similarity(description, otherDescription);
+      contentScore += overlap < 0.15 ? points.differentDescription : points.description * overlap;
+    }
+
+    let score = contentScore;
+    score += difference === 0 ? points.start : points.nearbyStart;
+    if (sameEnd) score += points.end;
+    if (sharedReference && sameEnd && contentScore >= minimumContentPointsForReference)
+      score += points.reference;
+    score += locationScore(location, otherLocation, title, otherTitle);
+
+    if (score < duplicateThreshold) continue;
+    if (!best || score > best.score) best = { event, score };
   }
-  return possible;
+
+  if (exactReferenceMatch) return exactReferenceMatch;
+  if (!best) return null;
+  return {
+    kind: 'duplicate',
+    event: best.event,
+    reason: `予定の内容・日時を照合して一致（${Math.round(best.score)}点）`,
+  };
 }

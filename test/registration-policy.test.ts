@@ -88,6 +88,18 @@ test('期限を過ぎた用事は登録しない', () => {
   );
 });
 
+test('開始と終了が同じ時刻の期限は通知用の枠で登録候補に残す', () => {
+  const { mail, extraction } = example('申請期限');
+  const event = extraction.events[0]!;
+  event.startLocal = '2026-11-20T23:59:00';
+  event.endLocal = event.startLocal;
+  const plan = extractionToPlan(mail, extraction, now, finalize);
+  assert.equal(plan.events[0]?.payload?.start.dateTime, '2026-11-20T23:59:00.000+09:00');
+  assert.equal(plan.events[0]?.payload?.end.dateTime, '2026-11-21T00:14:00.000+09:00');
+  event.kind = 'appointment';
+  assert.equal(extractionToPlan(mail, extraction, now, finalize).decision, 'review');
+});
+
 test('モデルが指定した00:00は時刻付きの予定として扱う', () => {
   const { mail, extraction } = example('任意の提出期限');
   extraction.events[0]!.startLocal = '2026-11-20T00:00:00';

@@ -118,16 +118,10 @@ export function validateSelection(raw: unknown, now = new Date()): Selection {
       continue;
     }
     seen.add(proposal.eventKey);
-    const originalUID =
-      typeof event.identity === 'string' &&
-      event.identity.startsWith('ics:') &&
-      event.identity.endsWith(':')
-        ? event.identity.slice(4, -1)
-        : undefined;
     events.push({
       sourceUid: proposal.sourceUid,
       eventKey: proposal.eventKey,
-      iCalUID: originalUID || `${proposal.eventKey}@auto-calendar-register.local`,
+      iCalUID: calendarIcalUid(proposal.eventKey, event.identity),
       source: mail.source,
       sourceFrom: mail.from,
       sourceSubject: mail.subject,
@@ -147,6 +141,14 @@ export function validateSelection(raw: unknown, now = new Date()): Selection {
 
 export async function readSelection(file: string, now = new Date()) {
   return validateSelection(JSON.parse(await readFile(file, 'utf8')), now);
+}
+
+export function calendarIcalUid(eventKey: string, identity?: string) {
+  if (typeof identity === 'string' && identity.startsWith('ics:') && identity.endsWith(':')) {
+    const original = identity.slice(4, -1);
+    if (original) return original;
+  }
+  return `${eventKey}@auto-calendar-register.local`;
 }
 
 export function googleEventId(eventKey: string) {

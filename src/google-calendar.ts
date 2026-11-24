@@ -26,6 +26,16 @@ export interface CalendarPort {
   insert(event: CalendarPayload & { id: string }): Promise<GoogleEvent>;
 }
 
+function googleEventBody(event: CalendarPayload & { id: string }) {
+  const { allDayDate, ...payload } = event;
+  if (!allDayDate) return payload;
+  return {
+    ...payload,
+    start: { date: allDayDate },
+    end: { date: DateTime.fromISO(payload.end.dateTime, { setZone: true }).toISODate()! },
+  };
+}
+
 export class CalendarApiError extends Error {
   constructor(readonly status: number) {
     super(
@@ -101,15 +111,12 @@ export class GoogleCalendar implements CalendarPort {
     return results;
   }
   async insert(event: CalendarPayload & { id: string }) {
-    const { allDayDate, ...payload } = event;
-    const data = allDayDate
-      ? {
-          ...payload,
-          start: { date: allDayDate },
-          end: { date: DateTime.fromISO(payload.end.dateTime, { setZone: true }).toISODate()! },
-        }
-      : payload;
-    return this.request<GoogleEvent>('POST', this.url, { sendUpdates: 'none' }, data);
+    return this.request<GoogleEvent>(
+      'POST',
+      this.url,
+      { sendUpdates: 'none' },
+      googleEventBody(event),
+    );
   }
 }
 
@@ -155,7 +162,7 @@ export type SyncRow = {
     | 'created'
     | 'would_create'
     | 'duplicate'
-    | 'possible_duplicate'
+    | 'possible_duplicate' // 保存済みの照合結果
     | 'previously_registered'
     | 'previously_deleted'
     | 'past'
@@ -221,7 +228,9 @@ export async function syncCalendar(
           row.action = 'past';
         else if (!options.apply) {
           row.action = 'would_create';
-          withinBatch.push({ ...selected.payload, id: googleEventId(selected.eventKey) });
+          withinBatch.push(
+            googleEventBody({ ...selected.payload, id: googleEventId(selected.eventKey) }),
+          );
         } else {
           try {
             const created = await port.insert({

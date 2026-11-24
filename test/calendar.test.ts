@@ -192,16 +192,170 @@ test('Grokbot等の既存予定とタイトル・UTC開始日時が一致すれ�
   assert.equal(port.inserts, 0);
 });
 
-test('タイトルが違っても同時刻の既存予定は重複の疑いとして保留', async () => {
+test('同時刻に別の予定があっても新規登録する', async () => {
   const port = new MemoryCalendar();
   port.events = [
     { id: 'existing', summary: '別のタイトル', start: { dateTime: '2026-11-30T09:00:00Z' } },
   ];
   assert.equal(
     (await syncCalendar(selection(), port, { apply: true, now: () => now }))[0]?.action,
-    'possible_duplicate',
+    'created',
   );
+  assert.equal(port.inserts, 1);
+});
+
+test('タイトルが違っても、本文の類似と近い開始時刻で重複を検出する', async () => {
+  const event = selected();
+  event.payload.summary = '選考のオンライン面談';
+  event.payload.description = '担当者は開発部の田中さん。作品集と身分証をご用意ください。';
+  const port = new MemoryCalendar();
+  port.events = [
+    {
+      id: 'existing',
+      summary: 'チームとの打ち合わせ',
+      description: '<p>担当者は開発部の田中さん。作品集と身分証をご用意ください。</p>',
+      start: { dateTime: '2026-11-30T09:10:00Z' },
+    },
+  ];
+  const rows = await syncCalendar({ ...selection(), events: [event] }, port, {
+    apply: true,
+    now: () => now,
+  });
+  assert.equal(rows[0]?.action, 'duplicate');
   assert.equal(port.inserts, 0);
+});
+
+test('開始時刻が近い場合は同じタイトルと場所を組み合わせて照合する', () => {
+  const event = selected();
+  const nearby = { summary: event.payload.summary, start: { dateTime: '2026-11-30T09:10:00Z' } };
+  assert.equal(matchExisting(event, [nearby]), null);
+  assert.equal(
+    matchExisting(event, [{ ...nearby, location: event.payload.location }])?.kind,
+    'duplicate',
+  );
+});
+
+test('タイトルの表記ゆれを類似度で照合する', () => {
+  const event = selected();
+  event.payload.summary = 'データ基盤更新作業の事前説明会';
+  assert.equal(
+    matchExisting(event, [
+      {
+        summary: 'データ基盤更新作業の事前説明会（社内）',
+        start: { dateTime: '2026-11-30T09:10:00Z' },
+        end: event.payload.end,
+        location: event.payload.location,
+      },
+    ])?.kind,
+    'duplicate',
+  );
+});
+
+test('タイトルの補足が違い、片方の場所が施設名だけでも日時と照合する', () => {
+  const event = selected();
+  event.payload.summary = 'Skyline 山風ロッジ 宿泊';
+  event.payload.location = '長野県上田市山町1-2-3';
+  assert.equal(
+    matchExisting(event, [
+      {
+        summary: 'Skyline 山風ロッジ（予約サイト経由）',
+        location: 'Skyline 山風ロッジ',
+        start: event.payload.start,
+        end: event.payload.end,
+      },
+    ])?.kind,
+    'duplicate',
+  );
+});
+
+test('本文に繰り返された日時や会場だけでは、同時刻の別予定を重複としない', () => {
+  const event = selected();
+  event.payload.location = '東京都渋谷区サンプルビル第三会議室';
+  event.payload.description = `開始：2026年11月30日 18:00\n終了：2026年11月30日 20:30\n会場：${event.payload.location}`;
+  const { description, start, end, location } = event.payload;
+  assert.equal(
+    matchExisting(event, [{ description, start, end, location, summary: '別の予定' }]),
+    null,
+  );
+});
+
+test('同じタイトルと時刻でも本文が大きく違えば別の予定として扱う', () => {
+  const event = selected();
+  event.payload.description = '海外営業部との輸出資料の確認。担当者は佐藤さん。';
+  assert.equal(
+    matchExisting(event, [
+      {
+        summary: event.payload.summary,
+        start: event.payload.start,
+        end: event.payload.end,
+        location: event.payload.location,
+        description: '提出物は設計図と原価表。建築工事の費用を確認します。',
+      },
+    ]),
+    null,
+  );
+});
+
+test('予約番号は予約単位の根拠として使い、同じ日の別便は登録候補に残す', () => {
+  const event = selected();
+  event.payload.summary = '日帰り旅行の復路';
+  event.payload.description = '予約ID：ABC12345';
+  const outbound = {
+    summary: '日帰り旅行の往路',
+    description: '受付番号：ABC12345',
+    start: { dateTime: '2026-11-30T00:00:00Z' },
+  };
+  assert.equal(matchExisting(event, [outbound]), null);
+  assert.equal(matchExisting(event, [{ ...outbound, start: event.payload.start }]), null);
+  assert.equal(
+    matchExisting(event, [
+      { ...outbound, start: event.payload.start, end: { dateTime: '2026-11-30T11:00:00Z' } },
+    ]),
+    null,
+  );
+  assert.equal(
+    matchExisting(event, [{ ...outbound, start: event.payload.start, end: event.payload.end }])
+      ?.kind,
+    'duplicate',
+  );
+  assert.equal(
+    matchExisting(event, [
+      { ...outbound, start: event.payload.start, description: '受付番号：XYZ98765' },
+    ]),
+    null,
+  );
+});
+
+test('予約番号と開始・終了が一致すれば本文や場所の違いで重複判定を覆さない', () => {
+  const event = selected();
+  event.payload.summary = 'ABC→DEF 搭乗';
+  event.payload.description = '予約ID：ABC12345\nチェックインは出発の3時間前から利用できます。';
+  event.payload.location = '出発空港第1ターミナル';
+  const existing = {
+    summary: '国内発海外行きの航空便',
+    description: '予約番号：ABC12345\n機内持ち込み手荷物は合計7キログラム以内です。',
+    location: '国際線ターミナル出発ロビー',
+    start: { dateTime: '2026-11-30T09:00:00Z' },
+    end: { dateTime: '2026-11-30T11:30:00Z' },
+  };
+  assert.equal(
+    matchExisting(event, [existing])?.reason,
+    '予約・受付・注文番号と開始・終了日時が一致',
+  );
+});
+
+test('時刻に差があるときは内容が似ていれば参照番号を重視する', () => {
+  const event = selected();
+  event.payload.summary = 'ネットワーク機器の現地交換作業';
+  event.payload.description = '受付番号：JOB12345';
+  const existing = {
+    summary: '機器の現地交換作業（受付済）',
+    description: '参照番号：JOB12345',
+    start: { dateTime: '2026-11-30T09:10:00Z' },
+    end: event.payload.end,
+  };
+  assert.equal(matchExisting(event, [existing])?.kind, 'duplicate');
+  assert.equal(matchExisting(event, [{ ...existing, description: '' }]), null);
 });
 
 test('カレンダー上で削除済みの管理予定は復活させない', async () => {
@@ -247,15 +401,18 @@ test('同時登録で409になった場合は既存IDを確認し、二重登録
   );
 });
 
-test('ICSインポート済み・終日予定も既存予定の照合対象', () => {
+test('ICS UIDと終日予定を照合し、時刻付き予定と終日予定は区別する', () => {
   assert.equal(
     matchExisting(selected(), [{ id: 'imported', iCalUID: selected().iCalUID }])?.kind,
     'duplicate',
   );
-  assert.equal(
-    matchExisting(selected(), [{ summary: '試験', start: { date: '2026-11-30' } }])?.kind,
-    'possible_duplicate',
-  );
+  const allDay = { summary: '試験', start: { date: '2026-11-30' } };
+  assert.equal(matchExisting(selected(), [allDay]), null);
+  const event = selected();
+  event.payload.allDayDate = '2026-11-30';
+  event.payload.start.dateTime = '2026-11-30T00:00:00+09:00';
+  event.payload.end.dateTime = '2026-12-01T00:00:00+09:00';
+  assert.equal(matchExisting(event, [allDay])?.kind, 'duplicate');
 });
 
 test('Google APIアダプターは全ページを取得し、カレンダーIDをエスケープ', async () => {

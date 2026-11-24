@@ -343,7 +343,7 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
     });
     await store.finishRun(run, 'completed', { doNotRegister: 1 });
     await t.test(
-      'calendar duplicate decisions are binary and never insert an uncertain match',
+      'an old possible-duplicate result does not block registration of a different event at the same time',
       async () => {
         let inserts = 0;
         const port: CalendarPort = {
@@ -362,10 +362,14 @@ test('PostgreSQL persistence and SQL dump round-trip', async (t) => {
           pastSkipped: 0,
           repeatedSkipped: 0,
         };
-        const row = (await syncCalendar(selection, port, { apply: true }))[0]!;
-        assert.equal(row.shouldRegister, false);
-        assert.equal(inserts, 0);
-        await store.saveSync(run, target, 'primary', selected, row);
+        const row = (
+          await syncCalendar(selection, port, {
+            apply: true,
+            findRegistration: (event) => store.findRegistration(target, event),
+          })
+        )[0]!;
+        assert.equal(row.action, 'created');
+        assert.equal(inserts, 1);
       },
     );
     await t.test(

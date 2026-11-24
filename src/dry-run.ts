@@ -29,15 +29,9 @@ import { mailLabel, sourceScope } from './domain/mail.js';
 import { inspectDatePresence } from './date-presence.js';
 import { shortlistReason } from './mail-shortlist.js';
 import type { CollectedMail } from './domain/mail.js';
-
-type ExistingEvent = {
-  id?: string;
-  status?: string;
-  summary?: string;
-  iCalUID?: string;
-  start?: { dateTime?: string; date?: string };
-  extendedProperties?: { private?: { sourceEventKey?: string } };
-};
+import type { ExistingCalendarEvent } from './domain/calendar.js';
+import { matchExisting } from './event-matching.js';
+import { calendarIcalUid } from './selection.js';
 
 export async function readCollection(path: string, since: Date): Promise<Collection> {
   const data = JSON.parse(await readFile(path, 'utf8')) as Collection;
@@ -53,28 +47,23 @@ export async function readCollection(path: string, since: Date): Promise<Collect
   return data;
 }
 
-export function applyExistingEvents(plans: MailPlan[], existing: ExistingEvent[]) {
-  const normalize = (text: string) => text.normalize('NFKC').toLowerCase().replace(/\s/g, '');
+export function applyExistingEvents(plans: MailPlan[], existing: ExistingCalendarEvent[]) {
   for (const plan of plans)
     for (const event of plan.events) {
-      if (event.decision !== 'candidate') continue;
-      const match = existing.find(
-        (e) =>
-          e.status !== 'cancelled' &&
-          ((event.eventKey && e.extendedProperties?.private?.sourceEventKey === event.eventKey) ||
-            (event.identity?.startsWith('ics:') &&
-              e.iCalUID &&
-              event.identity === `ics:${e.iCalUID}:`) ||
-            (e.summary &&
-              normalize(e.summary) === normalize(event.title) &&
-              e.start?.dateTime &&
-              event.start &&
-              new Date(e.start.dateTime).getTime() === new Date(event.start).getTime())),
+      if (event.decision !== 'candidate' || !event.eventKey || !event.payload) continue;
+      const match = matchExisting(
+        {
+          sourceUid: plan.uid,
+          eventKey: event.eventKey,
+          iCalUID: calendarIcalUid(event.eventKey, event.identity),
+          payload: event.payload,
+        },
+        existing,
       );
       if (match) {
         event.decision = 'duplicate';
         delete event.payload;
-        event.reasons.push(`既存カレンダースナップショットと一致: ${match.id ?? '(IDなし)'}`);
+        event.reasons.push(match.reason);
       }
     }
   for (const plan of plans)
@@ -255,7 +244,7 @@ export async function writeDryRun(
   if (progressOnly && total) logProgress(total);
   if (existingFile) {
     const raw = JSON.parse(await readFile(existingFile, 'utf8'));
-    const existing: ExistingEvent[] = Array.isArray(raw) ? raw : raw.items;
+    const existing: ExistingCalendarEvent[] = Array.isArray(raw) ? raw : raw.items;
     if (!Array.isArray(existing))
       throw new Error(
         '既存予定は配列またはGoogle Events形式の { items: [...] } を指定してください。',
